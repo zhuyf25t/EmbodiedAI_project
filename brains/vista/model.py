@@ -1,6 +1,6 @@
 """OpenAI-compatible Chat Completions, preserving tool requests across rounds.
 
-Exactly one POST per invoke: no path probing, streaming, or automatic retries.
+Connection establishment can be retried. An accepted request is never replayed.
 The configured endpoint must support both image inputs and function tools.
 """
 
@@ -10,6 +10,7 @@ import base64
 import io
 import json
 import os
+import time
 from copy import deepcopy
 from urllib.parse import urlsplit
 
@@ -172,10 +173,16 @@ class ChatModel:
     def invoke(self, messages, *, tools: list[dict], system: str) -> AIMessage:
         body = {"model": self.model, "messages": api_messages(messages, system),
                 "tools": tools, "tool_choice": "auto", "stream": False, **self.options}
-        try:
-            response = self._client.post(self.endpoint, headers=self._headers, json=body)
-        except httpx.HTTPError as error:
-            raise RuntimeError(f"VISTA 模型请求失败（{type(error).__name__}），未自动重试。") from None
+        for attempt in range(3):
+            try:
+                response = self._client.post(self.endpoint, headers=self._headers, json=body)
+                break
+            except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+                if attempt == 2:
+                    raise RuntimeError(f"VISTA 无法建立连接（{type(error).__name__}，3 次）。") from None
+                time.sleep(1 + attempt)
+            except httpx.HTTPError as error:
+                raise RuntimeError(f"VISTA 模型请求失败（{type(error).__name__}）。") from None
         if not response.is_success:
             advice = {401: "检查 API 凭据", 403: "检查访问权限", 404: "检查完整 API 地址（包括所需 /v1）",
                       413: "上下文或图片过大", 429: "请求限流或配额不足"}.get(

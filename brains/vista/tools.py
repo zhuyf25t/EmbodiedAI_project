@@ -1,4 +1,4 @@
-"""Nine model-facing tools. Only play/finish hand control back to the collector."""
+"""VISTA model-facing tools. Only play/finish hand control back to the collector."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def _check(schema, value, path="参数"):
             raise _Arguments("INVALID_ARGUMENT", f"{path} 超出允许范围")
 
 
-def tool_schemas(settings: VistaSettings, actions: dict, cameras=CAMERAS) -> list[dict]:
+def tool_schemas(settings: VistaSettings, actions: dict, cameras=CAMERAS, with_ruler=False, mark_spans=False) -> list[dict]:
     coordinates = ("原图像素坐标：左上角 (0,0)，x 向右，y 向下；"
                    "区域为 [x,x+width) × [y,y+height)，必须在原图宽高内；不是展示裁图坐标。")
     region = _object({name: _integer(coordinates if name in ("x", "y") else "原图区域的正整数宽/高")
@@ -143,7 +143,7 @@ def tool_schemas(settings: VistaSettings, actions: dict, cameras=CAMERAS) -> lis
                   "limit": {**_integer("最多返回的批次或抽样帧条数，不是动作数", 1, settings.history_max_limit),
                             "default": settings.history_default_limit}})),
         ("read_guide", "读取共享指南及其revision版本；其他进程也会更新。" + guide_scope, _object({})),
-        ("write_guide", "终帧复核时，记录按 system prompt 操作且经前后帧验证的跨局技巧。写明适用条件和证据帧号。没有新技巧可以直接 finish。完整替换指南，base_revision 须为你已读版本。"
+        ("write_guide", "终帧复核时，记录按 system prompt 操作且经前后帧验证的跨局技巧。写明适用条件和证据帧号。固定标尺的轴向、物理参数与控制错误码以系统说明为准；不要从单局推断其定义，也不要把单局绝对目标或腕角写成默认值。没有新技巧可以直接 finish。完整替换指南，base_revision 须为你已读版本。"
          "发生GUIDE_CONFLICT时本次没有写入；先read_guide重读，由你合并新旧经验后再提交，不能原样覆盖他人更新。" + guide_scope,
          _object({"content": _text("合并后完整新版指南", settings.max_guide_chars),
                   "base_revision": _text("从初始指南或read_guide返回值复制的revision", 64)},
@@ -165,16 +165,32 @@ def tool_schemas(settings: VistaSettings, actions: dict, cameras=CAMERAS) -> lis
                   "evidence_frame_ids": {"type": "array", "maxItems": settings.max_views,
                                          "items": _text("本 episode 已归档的证据帧编号", 64)}}, ("success", "reason"))),
     ]
+    if with_ruler:
+        definitions.append(("read_ruler", "读取指定手臂毫米标尺上 9×9 个固定刻度的原始 RGB（十六进制）。模型指定要核实的区域，工具不识别方块，不输出动作。",
+            _object({"frame_id": _text("已有 front 图的帧号",64),
+                     "arm": {"type":"string","enum":["left","right"] if "left_wrist" in cameras else ["right"]},
+                     "x_mm": _integer("采样中心的本机 X",130,320), "y_mm": _integer("采样中心的本机 Y",-270,270),
+                     "step_mm": {"type":"integer","enum":[2,5,10,20]},
+                     "plane_mm": {"type":"integer","enum":[30,60],"description":"桌上顶面用30（默认），叠好后的上层顶面用60"}},
+                    ("frame_id","arm","x_mm","y_mm","step_mm"))))
+    if mark_spans:
+        edge_pair = {"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2}
+        definitions.append(("mark_span", "记录你亲自从亮色顶面读出的 X/Y 毫米边界。只对你给的数字取中点，返回并保留你的测量，不读像素、不行动。",
+            _object({"label":{"type":"string","enum":["red_source","green_source","red_placed"]},
+                     "frame_id":_text("读数所据的 front 帧",64),"x_edges":edge_pair,"y_edges":edge_pair},
+                    ("label","frame_id","x_edges","y_edges"))))
     return [{"type": "function", "function": {"name": name, "description": description,
                                                "parameters": schema}}
             for name, description, schema in definitions]
 
 
 class VistaTools:
-    def __init__(self, storage: VistaStorage, settings: VistaSettings, control_schemas: dict):
+    def __init__(self, storage: VistaStorage, settings: VistaSettings, control_schemas: dict, *, ruler_reader=None, mark_spans=False):
+        self.ruler_reader = ruler_reader
+        self.marks = {}
         self.storage, self.settings = storage, settings
         self.actions = control_schemas
-        self.schemas = tool_schemas(settings, self.actions, storage.cameras)
+        self.schemas = tool_schemas(settings, self.actions, storage.cameras, with_ruler=ruler_reader is not None, mark_spans=mark_spans)
         self.parameters = {item["function"]["name"]: item["function"]["parameters"] for item in self.schemas}
 
     def _frame(self, frame_id):
@@ -208,7 +224,7 @@ class VistaTools:
         """None means a validated handoff; it does NOT mean physical success."""
         try:
             if name not in self.parameters:
-                raise _Arguments("UNKNOWN_TOOL", "未知工具，请使用提供的九个工具名")
+                raise _Arguments("UNKNOWN_TOOL", "未知工具，请使用提供的工具名")
             if isinstance(args, dict):
                 views = args.get("views")
                 if name in ("inspect", "read_pixels") and isinstance(views, list) and len(views) > self.settings.max_views:
@@ -227,6 +243,20 @@ class VistaTools:
                 if name == "read_pixels" and (".rows" in str(error) or ".columns" in str(error)):
                     error.code = "INVALID_GRID"
                 raise
+            if name == "mark_span":
+                self._frame(args["frame_id"])
+                xy = [sum(args[key])/2 for key in ("x_edges","y_edges")]
+                self.marks[args["label"]] = {"center_xy_mm":xy, "frame_id":args["frame_id"],
+                                             "x_edges":args["x_edges"],"y_edges":args["y_edges"]}
+                return success({"your_visual_measurements_mm":deepcopy(self.marks)}), []
+            if name == "read_ruler":
+                self._frame(args["frame_id"])
+                photo = self.storage.load_image(args["frame_id"], "front")
+                sampled, crop = self.ruler_reader(photo, args["arm"], args["x_mm"], args["y_mm"], args["step_mm"], args.get("plane_mm",30))
+                meta = {"arm":args["arm"], "frame_id":args["frame_id"], "plane_mm":args.get("plane_mm",30),
+                        "center_xy_mm":[args["x_mm"],args["y_mm"]], "tick_spacing_mm":args["step_mm"]}
+                views = [({**meta,"view":"front ruler crop: +X right, +Y up"},crop)] if crop is not None else []
+                return success({**meta, **sampled}), views
             if name == "play":
                 if getattr(self, "review_only", False):
                     raise _Arguments("EPISODE_CLOSED", "仿真已结束，检查终帧并调用 finish。")
@@ -328,7 +358,7 @@ class VistaTools:
                 raise
         # All text tool results precede any user image block, including multi-tool replies.
         if images:
-            message = image_message(images, "以下是本轮 inspect 请求的归档图片；环境未变化，当前帧编号保持不变。")
+            message = image_message(images, "以下是本轮查询的相机图像或带刻度的相机裁图；环境未变化，当前帧编号保持不变。")
             self.storage.log_message(message)
             messages.append(message)
         return {"messages": messages}

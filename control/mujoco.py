@@ -7,9 +7,10 @@ from contracts import FrameObservation, JOINT_NAMES, JointPositions
 
 
 class MujocoArm:
-    def __init__(self, model, data, prefix="", renderer=None, *, wrist_camera="wrist_cam"):
+    def __init__(self, model, data, prefix="", renderer=None, *, wrist_camera="wrist_cam", front_image=None):
         self.model, self.data = model, data
         self.wrist_camera = prefix + wrist_camera
+        self.front_image = front_image
         self.qpos_ids = [model.joint(prefix + name).qposadr.item() for name in JOINT_NAMES]
         self.actuator_ids = [model.actuator(prefix + name).id for name in JOINT_NAMES]
         self.limits = model.actuator_ctrlrange[self.actuator_ids]
@@ -43,7 +44,10 @@ class MujocoArm:
         images = {}
         for name, camera in cameras:
             self.renderer.update_scene(self.data, camera=camera)
-            images[name] = self.renderer.render()
+            rgb = self.renderer.render()
+            if name == "front" and self.front_image is not None:
+                rgb = self.front_image(rgb, self.model.camera(camera).fovy.item())
+            images[name] = rgb
         return images
 
     def local_tcp(self):
@@ -54,11 +58,13 @@ class MujocoArm:
         images = self.render((("wrist", self.wrist_camera), ("front", "front")))
         return FrameObservation(frame_no, images, self.read_positions(), prompt, tuple(self.local_tcp() * 1000))
 
-    def solve_top_down(self, xyz, opening):
-        """Keep fingers downward, with the jaws closing along the base Y axis."""
+    def solve_top_down(self, xyz, opening, yaw_deg=0.0):
+        """Zero yaw closes along local +Y. Positive yaw rotates about local +Z."""
         rotation = self.data.xmat[self.base].reshape(3, 3)
         target = self.data.xpos[self.base] + rotation @ np.asarray(xyz, dtype=float)
-        upright = rotation @ np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
+        angle = np.radians(yaw_deg)
+        c, s = np.cos(angle), np.sin(angle)
+        upright = rotation @ np.array([[-s, -c, 0], [c, -s, 0], [0, 0, 1]])
         # Only the scratch state is used during IK; this never moves a live body.
         scratch = self.ik_data
         arm_ids = self.qpos_ids[:5]
@@ -84,9 +90,9 @@ class MujocoArm:
 
 class DualArm:
     """Left then right for recording; each Cartesian interface uses its own base."""
-    def __init__(self, model, data, *, wrist_camera="wrist_cam"):
-        left = MujocoArm(model, data, "left_", wrist_camera=wrist_camera)
-        self.arms = {"left": left, "right": MujocoArm(model, data, "right_", left.renderer, wrist_camera=wrist_camera)}
+    def __init__(self, model, data, *, wrist_camera="wrist_cam", front_image=None):
+        left = MujocoArm(model, data, "left_", wrist_camera=wrist_camera, front_image=front_image)
+        self.arms = {"left": left, "right": MujocoArm(model, data, "right_", left.renderer, wrist_camera=wrist_camera, front_image=front_image)}
 
     def commanded_positions(self):
         return JointPositions(tuple(x for arm in self.arms.values() for x in arm.commanded_positions().values))

@@ -4,7 +4,7 @@ from copy import deepcopy
 import numpy as np
 
 from contracts import JointPositions
-from control.skills import interpolate, set_gripper
+from control.skills import HOME, interpolate, set_gripper
 from control.stability import compare_images
 
 
@@ -24,9 +24,12 @@ ACTIONS = {
 
 
 def action_schemas(dual):
-    if not dual:
-        return ACTIONS
     actions = deepcopy(ACTIONS)
+    actions["move_by"]["parameters"]["properties"]["grasp_yaw_deg"] = {
+        "type": "number", "minimum": -45, "maximum": 45,
+        "description": "夹爪朝向绝对角，0 沿本机 +Y 闭合，正角绕 +Z。省略保持原朝向。"}
+    if not dual:
+        return actions
     for name in ("move_by", "open_gripper", "close_gripper"):
         schema = actions[name]["parameters"]
         schema["properties"]["arm"] = {"type": "string", "enum": ["left", "right"]}
@@ -40,6 +43,24 @@ class ArmExecutor:
         self.target = env.arm.commanded_positions()
         self.info = {}
         self.pending_hold = None
+        self.yaw = {side: 0.0 for side in env.arms}
+
+    def home(self):
+        """Return empty arms sequentially. Every interpolated and hold tick uses advance()."""
+        begin = self.obs.frame_no
+        for i, side in enumerate(self.env.arms):
+            start = self.target
+            index = i * 6
+            desired = JointPositions(start.values[:index] + HOME.values + start.values[index+6:])
+            if not self.env.home_path_clear(side, HOME):
+                raise RuntimeError(f"Obstructed home path for {side}")
+            distance = np.max(np.abs(np.subtract(desired.values, start.values)))
+            for target in interpolate(start, desired, max(2, math.ceil(1.5 * distance / .065))):
+                self.advance(target)
+            if self._settle("home", desired, None, side):
+                raise RuntimeError(f"Home did not settle for {side}")
+            self.yaw[side] = 0.0
+        return (begin, self.obs.frame_no)
 
     def advance(self, target):
         previous = self.obs
@@ -73,7 +94,7 @@ class ArmExecutor:
             if name != "observe" and not (pending_name == name and name in ("close_gripper", "open_gripper")
                                           and args.get("arm", "right") == side):
                 return "HOLD_REQUIRED"
-            return self._settle(name, self.target, xyz, side)
+            return self._settle(pending_name, self.target, xyz, side)
         side = args.get("arm", "right")
         arm = self.env.arms[side]
         index = list(self.env.arms).index(side) * 6
@@ -86,7 +107,9 @@ class ArmExecutor:
             delta = [args[k] for k in ("dx_mm", "dy_mm", "dz_mm")]
             xyz = self._tcp(side) + delta
             try:
-                arm_goal = arm.solve_top_down(xyz / 1000, arm_start.values[-1])
+                yaw = args.get("grasp_yaw_deg", self.yaw[side])
+                arm_goal = arm.solve_top_down(xyz / 1000, arm_start.values[-1], yaw)
+                self.yaw[side] = yaw
             except ValueError:
                 return "UNREACHABLE"
             distance = max(abs(a - b) for a, b in zip(arm_goal.values[:5], arm_start.values[:5]))
@@ -124,4 +147,16 @@ class ArmExecutor:
             if self.env.done:
                 return "EPISODE_LIMIT"
             previous_ready, previous_contact = ready, contact
+        delta = np.abs(np.subtract(self.obs.state.values, previous.state.values)).reshape(-1,6)
+        blocked_still = (delta[:,:5].max() < .003 and delta[:,5].max() < .005 and
+                              all(compare_images(previous.images[c], self.obs.images[c]) for c in self.obs.images))
+        if name == "move_by" and blocked_still and not ready:
+            # A stationary physical stop is a failed move. Start the next plan at
+            # measured joints, keeping the gripper's commanded force on any payload.
+            start = list(self.target.values)
+            index = list(self.env.arms).index(side) * 6
+            start[index:index+5] = self.obs.state.values[index:index+5]
+            self.target = JointPositions(tuple(start))
+            self.pending_hold = None
+            return "MOTION_BLOCKED"
         return "SETTLE_TIMEOUT"

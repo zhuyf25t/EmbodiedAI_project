@@ -7,6 +7,9 @@ from contracts import CONTROL_HZ
 
 
 def footer(info):
+    if "cube_clearance_m" in info:
+        return (f"red bottom {1000 * info['cube_clearance_m']:.1f} mm   "
+                f"fixed={int(info['fixed_contact'])} moving={int(info['moving_contact'])}   success={int(info['success'])}")
     if "inside" in info:
         detail = "in zone " + " ".join(f"{c}={int(v)}" for c, v in info["inside"].items())
     else:

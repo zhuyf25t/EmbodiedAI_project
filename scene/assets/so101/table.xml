@@ -1,0 +1,36 @@
+<mujoco>
+  <option timestep=".002" iterations="50" integrator="implicitfast" cone="elliptic" ls_iterations="20" impratio="10"/>
+  <statistic center=".30 .26 .10" extent=".65"/>
+  <visual>
+    <global offwidth="640" offheight="480"/>
+    <headlight ambient=".52 .52 .52" diffuse=".22 .22 .22"/>
+  </visual>
+  <asset>
+    <model name="arm" file="so101.xml"/>
+    <material name="tape" rgba=".075 .075 .08 1"/>
+    <texture name="red_print" type="cube" file="red_print.png" gridsize="6 1" gridlayout="RLUDFB"/>
+    <texture name="green_print" type="cube" file="green_print.png" gridsize="6 1" gridlayout="RLUDFB"/>
+    <material name="red_block" texture="red_print"/>
+    <material name="green_block" texture="green_print"/>
+  </asset>
+  <worldbody>
+    <!-- World X runs across the diagram to the right, Y into the table. Both arms face +Y. -->
+    <frame pos=".481 .025 0" quat=".70710678 0 0 .70710678"><attach model="arm" body="base" prefix="right_"/></frame>
+    <frame pos=".119 .025 0" quat=".70710678 0 0 .70710678"><attach model="arm" body="base" prefix="left_"/></frame>
+    <light pos=".15 .1 1" dir=".12 .2 -1" directional="true" castshadow="false" diffuse=".56 .56 .56" specular=".025 .025 .025"/>
+    <geom name="table" type="box" pos=".6 .30 -.018" size=".60 .30 .018" rgba=".74 .74 .73 1"/>
+    <!-- Visual tape, flush with the table. Bounds are the inner edges. -->
+    <site name="near_band" type="box" pos=".30 .159 .0001" size=".28 .009 .0001" material="tape" group="1"/>
+    <site name="far_band" type="box" pos=".30 .341 .0001" size=".28 .009 .0001" material="tape" group="1"/>
+    <site type="box" pos=".029 .25 .0001" size=".009 .10 .0001" material="tape" group="1"/>
+    <site type="box" pos=".213 .175 .0001" size=".009 .175 .0001" material="tape" group="1"/>
+    <site type="box" pos=".387 .175 .0001" size=".009 .175 .0001" material="tape" group="1"/>
+    <site type="box" pos=".571 .25 .0001" size=".009 .10 .0001" material="tape" group="1"/>
+    <site type="box" pos=".609 .30 .0001" size=".009 .30 .0001" material="tape" group="1"/>
+    <site name="green_target" type="box" pos=".121 .250 0" size=".083 .082 .0001" rgba="0 0 0 0"/>
+    <site name="mixed" type="box" pos=".300 .250 0" size=".078 .082 .0001" rgba="0 0 0 0"/>
+    <site name="red_target" type="box" pos=".479 .250 0" size=".083 .082 .0001" rgba="0 0 0 0"/>
+    <!-- Intermediate pinhole image. The recorded front image uses the course K,D. -->
+    <camera name="front" pos=".316 .260 .407" xyaxes="-.99973426 .02259633 -.00456320 -.02224907 -.99760278 -.06552610" fovy="101.64"/>
+  </worldbody>
+</mujoco>

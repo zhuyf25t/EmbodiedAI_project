@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from collection.recorder import save_json
-from contracts import CONTROL_HZ, DUAL_JOINT_NAMES, JOINT_NAMES
+from contracts import CONTROL_HZ, DUAL_JOINT_NAMES, JOINT_NAMES, JointPositions, SCENE_VERSION
 from scene.task_video import TaskVideo
 
 
@@ -18,7 +18,40 @@ def records(path):
     return [json.loads(line) for line in path.read_text("utf8").splitlines()]
 
 
-def review(run, entry, manifest):
+def replay_actions(task, entry, raw, ticks):
+    """Reapply recorded targets from random f0; audit state, judges and camera boundaries."""
+    from scene.env import TabletopEnv
+    from scene.lift import Lift
+    from scene.stack import Stack
+    from scene.sort import Sort
+
+    edges = sorted({0, entry["home_end_frame"]-1, entry["home_end_frame"], len(ticks)})
+    image_errors = []
+    with TabletopEnv({"lift":Lift,"stack":Stack,"sort":Sort}[task]) as env:
+        obs, _ = env.reset(seed=entry["seed"],finish_on_success=False,limit_ticks=False)
+        for i in range(len(ticks)+1):
+            if i in edges:
+                if i:
+                    obs = env.arm.observe(i, env.task.prompt)
+                for name, rgb in obs.images.items():
+                    with Image.open(raw/"frames"/name/(obs.frame_id+".png")) as saved:
+                        error = np.abs(rgb.astype("i2")-np.asarray(saved))
+                        image_errors.append(float(error.mean()))
+            if i == len(ticks):
+                break
+            row = ticks[i]
+            state = [v for arm in env.arms.values() for v in arm.read_positions().values]
+            np.testing.assert_allclose(state, row["state"], atol=1e-7, rtol=0)
+            info = env.step_physics(JointPositions(tuple(row["action"])))[-1]
+            for key, value in info.items():
+                if isinstance(value, (float, np.floating)):
+                    np.testing.assert_allclose(value, row["judge_after"][key], atol=1e-7, rtol=0)
+                elif value != row["judge_after"][key]:
+                    raise ValueError(f"Replay mismatch at {i+1}: {key}")
+    return dict(ticks=len(ticks), frames_compared=edges, max_camera_mean_abs_error=max(image_errors))
+
+
+def review(run, entry, manifest, replay=False):
     ep = f"ep_{entry['seed']:04d}"
     task = manifest["task"]
     raw = run / "raw" / ep
@@ -29,7 +62,13 @@ def review(run, entry, manifest):
     requests = {v["tool_call_id"]: v for v in events if v["event"] == "tool_request"}
     receipts = []
     labels = {0: "reset"}
-    ends = {0, len(ticks)}
+    home = entry.get("home_end_frame", 0)
+    for i, tick in enumerate(ticks):
+        if "phase" in tick and entry["status"] == "finished":
+            assert tick["phase"] == ("home" if i < home else "vista")
+        if tick.get("phase") == "home":
+            labels[i + 1] = "control home"
+    ends = {0, max(0, home-1), home, len(ticks)}
     for event in events:
         if event["event"] != "tool_result":
             continue
@@ -50,6 +89,11 @@ def review(run, entry, manifest):
                 ends.add(end)
     if entry["status"] == "finished" and (len(receipts) != entry["play_rounds"] or len(labels) != len(ticks)+1):
         raise ValueError("Control ticks do not agree with play receipts")
+    if home and receipts:
+        assert receipts[0]["request"]["args"]["basis_frame_id"] == f"f{home:06d}"
+        save_json(out / "home_handoff.json", dict(home_end_frame=home,
+            first_play=receipts[0]["request"]["args"],
+            ticks=[ticks[i] for i in sorted({0,home-2,home-1,home,home+1}) if 0 <= i < len(ticks)]))
     save_json(out / "play_receipts.json", receipts)
     judges = [json.loads((raw / "reset.json").read_text("utf8"))["judge"]] + [t["judge_after"] for t in ticks]
     if entry["status"] == "finished" and judges[-1]["success"] != entry["success"]:
@@ -64,6 +108,8 @@ def review(run, entry, manifest):
             h = files.enter_context(h5py.File(run / entry["hdf5"], "r")) if entry.get("hdf5") else None
             if h is not None:
                 names = DUAL_JOINT_NAMES if task == "sort" else JOINT_NAMES
+                if "scene_version" in manifest:
+                    assert h.attrs["scene_version"] == manifest["scene_version"] and h.attrs["home_end_frame"] == home
                 assert tuple(json.loads(h.attrs["joint_names"])) == names
                 assert json.loads(h.attrs["camera_names"]) == cameras and h.attrs["task"] == task
                 assert h.attrs["seed"] == entry["seed"] and h.attrs["fps"] == CONTROL_HZ
@@ -97,8 +143,13 @@ def review(run, entry, manifest):
     reader = imageio_ffmpeg.read_frames(str(video_path))
     meta = next(reader)
     assert meta["fps"] == CONTROL_HZ and sum(1 for _ in reader) == len(judges)
-    save_json(out / "verification.json", dict(task=task, seed=entry["seed"], success=entry["success"],
-              ticks=len(ticks), video_frames=len(judges), cameras=cameras, verified_hdf5=entry.get("hdf5"),
+    physical = None
+    if replay:
+        if manifest.get("scene_version") != SCENE_VERSION:
+            raise ValueError("Replay requires the matching scene revision")
+        physical = replay_actions(task,entry,raw,ticks)
+    save_json(out / "verification.json", dict(physics_replay=physical, task=task, seed=entry["seed"], success=entry["success"],
+              home_end_frame=home, ticks=len(ticks), video_frames=len(judges), cameras=cameras, verified_hdf5=entry.get("hdf5"),
               play_rounds=len(receipts), final_judge=judges[-1]))
     print(out, entry["success"], len(ticks), judges[-1], flush=True)
 
@@ -106,8 +157,9 @@ def review(run, entry, manifest):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
+    parser.add_argument("--replay", action="store_true", help="Replay recorded targets in the matching physics scene")
     args = parser.parse_args()
     manifest = json.loads((args.run / "manifest.json").read_text("utf8"))
     for entry in manifest["episodes"]:
         if entry["status"] in ("finished", "interrupted"):
-            review(args.run, entry, manifest)
+            review(args.run, entry, manifest, replay=args.replay)

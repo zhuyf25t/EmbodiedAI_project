@@ -16,7 +16,7 @@ from .graph import build_graph
 from .model import ChatModel, image_message
 from .settings import VistaSettings
 from .state import (VistaState, batch_status,
-                    check_current_round_results, validate_reply)
+                    check_current_round_results, validate_reply, calls_of)
 from .storage import VistaStorage
 from .tools import VistaTools
 
@@ -41,12 +41,12 @@ class VistaBrain(Brain):
         self._closed = False
         self.decision_round = 0
 
-    def begin_episode(self, ep_dir, task_text, tool_schemas, *, episode_name=None):
+    def begin_episode(self, ep_dir, task_text, tool_schemas, *, episode_name=None, ruler_reader=None, mark_spans=False):
         if self._active or self._closed:
             raise RuntimeError("VISTA 必须结束上一 episode，且不能复用已关闭的 brain")
         if not isinstance(task_text, str) or not task_text.strip():
             raise RuntimeError("VISTA 任务描述不能为空")
-        self.tools = VistaTools(self.storage, self.settings, tool_schemas)
+        self.tools = VistaTools(self.storage, self.settings, tool_schemas, ruler_reader=ruler_reader, mark_spans=mark_spans)
         self.storage.begin_episode(Path(ep_dir), task_text, episode_name=episode_name)
         self._guide_revision = None
         self.state = {"messages": [], "model_calls": 0}
@@ -87,6 +87,20 @@ class VistaBrain(Brain):
                 if t["function"]["name"] not in unavailable], system=self.system_prompt)
             self.storage.event("model_response", decision_round=self.decision_round, model_call=attempt,
                                elapsed_seconds=time.monotonic() - request_started)
+            if not calls_of(reply) and attempt < self.max_model_calls:
+                self.storage.log_message(reply)
+                reminder = HumanMessage(content="这段文字没有执行任何操作，当前帧不变。请调用一个工具。"
+                                                "在动作阶段可继续取证或 play，终帧复核阶段可 finish。")
+                self.storage.log_message(reminder)
+                updates.extend((reply, reminder))
+                attempt += 1
+                self.storage.event("model_request", decision_round=self.decision_round, model_call=attempt,
+                                   reason="missing_tool")
+                request_started = time.monotonic()
+                reply = self.model.invoke([*messages, *updates[-2:]], tools=[t for t in self.tools.schemas
+                    if t["function"]["name"] not in unavailable], system=self.system_prompt)
+                self.storage.event("model_response", decision_round=self.decision_round, model_call=attempt,
+                                   elapsed_seconds=time.monotonic() - request_started)
             validate_reply(reply)
             self.storage.log_message(reply)
         except Exception as error:
@@ -94,7 +108,7 @@ class VistaBrain(Brain):
             raise
         return {"messages": [*updates, reply], "model_calls": attempt}
 
-    def decide(self, obs: FrameObservation, task_text, tool_schemas, history) -> list[Decision]:
+    def decide(self, obs: FrameObservation, task_text, tool_schemas, history, *, reference_views=()) -> list[Decision]:
         self._require_active()
         if self._finished:
             raise RuntimeError("VISTA 已接受 finish，不能再次请求本集模型")
@@ -112,7 +126,7 @@ class VistaBrain(Brain):
                            "guide": self.storage.read_memory("guide"),
                            "working": self.storage.read_memory("working")}
                 self._guide_revision = context["guide"]["revision"]
-                message = image_message(self.storage.model_views(info),
+                message = image_message([*self.storage.model_views(info), *reference_views],
                                         "本次任务、初始观察和初始笔记：\n" + json.dumps(context, ensure_ascii=False))
                 self._append([message])
             # Only the budget is reset. All previous requests, results and images remain.
@@ -225,9 +239,11 @@ class VistaBrain(Brain):
                 if item["error"] and item["error"].get("code") == "UNREACHABLE":
                     public["error"] = {"code": "UNREACHABLE", "message": "目标位姿不可达；请缩短或改变位移。", "can_retry": True}
                 if item["error"] and item["error"].get("code") == "SETTLE_TIMEOUT":
-                    public["error"] = {"code": "SETTLE_TIMEOUT", "message": "当前批停止，本局仍可继续。下一轮用 observe 继续持位，或重复当前开闭爪指令。稳定后再移动。", "can_retry": True}
+                    public["error"] = {"code": "SETTLE_TIMEOUT", "message": "当前批停止，本局仍可继续。下一轮用 observe 继续持位，或重复当前开闭爪指令。稳定后再移动；若下降受阻且画面已静止，可同手垂直向上退开。", "can_retry": True}
+                if item["error"] and item["error"].get("code") == "MOTION_BLOCKED":
+                    public["error"] = {"code": "MOTION_BLOCKED", "message": "连续两帧已静止但实际未到达指定目标。此动作失败；下一步从回传的实测 TCP 重新规划，保持夹爪指令。", "can_retry": True}
                 if item["error"] and item["error"].get("code") == "HOLD_REQUIRED":
-                    public["error"] = {"code": "HOLD_REQUIRED", "message": "新动作尚未施加。请先用 observe 保持上一目标直至连续两帧稳定。", "can_retry": True}
+                    public["error"] = {"code": "HOLD_REQUIRED", "message": "新动作尚未施加。请先用 observe 等待相邻两帧稳定。下降受阻且已静止时可同手原朝向纯竖直退开。", "can_retry": True}
                 if (item["action"] == "close_gripper" and item["status"] == "failed"
                         and item["action_applied"] is True
                         and isinstance(item["error"], dict)
@@ -256,6 +272,8 @@ class VistaBrain(Brain):
                 "after_frame_id": final_info["frame_id"] if final_info else None,
                 "execution_status": status, "action_results": results, "frame": frame}
         data["frame_range"] = [int(before[1:]), actual_end]
+        if self.tools.marks:
+            data["your_visual_measurements_mm"] = deepcopy(self.tools.marks)
         result = {"ok": status == "completed" and final_info is not None, "data": data, "error": error}
         try:
             self.storage.complete_batch(receipt["batch_id"], actual_end, results, status,

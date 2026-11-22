@@ -1,4 +1,5 @@
 """RGB stability test reused from MuJoCo-VISTA-ACT control/stability.py."""
+import cv2
 import numpy as np
 
 
@@ -29,4 +30,15 @@ def compare_images(previous: np.ndarray, current: np.ndarray) -> bool:
     local_counts = (integral[rows:, columns:] - integral[:-rows, columns:]
                     - integral[rows:, :-columns] + integral[:-rows, :-columns])
     local_ratio = float(local_counts.max() / (rows * columns))
-    return similarity >= 0.998 and local_ratio <= 0.10
+    if similarity >= 0.998 and local_ratio <= 0.10:
+        return True
+    # At macro focus a subpixel edge can flicker across a 24 px block. Accept it
+    # only if both full-resolution frames agree within one pixel everywhere.
+    if difference.mean() > .15:
+        return False
+    for source, target in ((previous, current), (current, previous)):
+        above = cv2.subtract(target, cv2.dilate(source, None))
+        below = cv2.subtract(cv2.erode(source, None), target)
+        if max(above.max(), below.max()) > 5:
+            return False
+    return True

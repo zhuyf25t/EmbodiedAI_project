@@ -7,7 +7,8 @@ from .cubes import TwoCubes
 
 class Sort(TwoCubes):
     dual = True
-    prompt = "将公共初始区的两块分拣，右臂放红块入红区，左臂放绿块入绿区，松爪后保持稳定。"
+    carry_height = .060
+    prompt = "将公共初始区的两块分拣，右臂放红块入图纸右格，左臂放绿块入图纸左格，松爪后保持稳定。"
     model_file = Path(__file__).parent / "assets/so101/sort.xml"
 
     def arrangement(self, model, data, pairs):

@@ -8,6 +8,6 @@ class ArmControl(Protocol):
 
     def command(self, target: JointPositions) -> None: ...
 
-    def solve_top_down(self, xyz: tuple[float, float, float], opening: float) -> JointPositions:
+    def solve_top_down(self, xyz: tuple[float, float, float], opening: float, yaw_deg: float = 0.0) -> JointPositions:
         """Solve a vertical tool pose in base coordinates (metres)."""
         ...

@@ -149,6 +149,9 @@ class RunWindow:
         ticks, self.tick_offset = new_lines(self.raw / "ticks.jsonl", self.tick_offset)
         if ticks:
             self.latest = int(ticks[-1]["next_frame"][1:])
+            for t in ticks:
+                if t.get("phase") == "home":
+                    self.actions.append((int(t["frame"][1:]), int(t["next_frame"][1:]), 0, "初姿回位"))
         self.read_activity()
         if self.current < self.latest:
             self.show_frame(self.current + 1)

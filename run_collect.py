@@ -10,10 +10,11 @@ from brains.vista.model import ChatModel
 from brains.vista.settings import VistaSettings
 from brains.vista.state import action_result, batch_status
 from collection.recorder import EpisodeRecorder, save_json
-from contracts import DUAL_CAMERAS, CAMERAS, ObservationWindow
+from contracts import DUAL_CAMERAS, CAMERAS, ObservationWindow, SCENE_VERSION
 from control.vista import action_schemas, ArmExecutor
 from scene.env import TabletopEnv
 from scene.lift import Lift
+from scene.front_ruler import front_ruler, sample_marks
 from scene.stack import Stack
 from scene.sort import Sort
 from scene.live_view import launch_viewer
@@ -75,7 +76,11 @@ def collect_episode(env, brain, data_dir, entry, persist, source, display=None, 
     schemas = action_schemas(env.dual)
     brain.storage.joint_names, brain.storage.cameras = env.joint_names, env.camera_names
     prompt = obs.prompt
-    brain.begin_episode(raw, prompt, schemas, episode_name=ep)
+    def ruler_reader(photo, side, x_mm, y_mm, step_mm, plane_mm):
+        return sample_marks(photo, env.data.camera("front"), env.data.xpos[env.arms[side].base], x_mm, y_mm, step_mm, plane_mm,
+                            include_crop=(task == 'stack'))
+
+    brain.begin_episode(raw, prompt, schemas, episode_name=ep, ruler_reader=ruler_reader, mark_spans=(task == 'stack'))
     brain.storage.ensure_frame(obs)
     save_json(raw / "reset.json", dict(seed=seed, frame=obs.frame_id, judge=initial))
     recorder = EpisodeRecorder(raw, brain.storage, env.joint_names, env.camera_names)
@@ -87,10 +92,25 @@ def collect_episode(env, brain, data_dir, entry, persist, source, display=None, 
     executor = ArmExecutor(env, obs, tick)
     reason = "play_round_limit"
     try:
+        try:
+            executor.home()
+        finally:
+            brain.storage.decision_start_frame = recorder.count
+        recorder.home_end_frame = recorder.count
+        recorder.phase = 'vista'
+        entry.update(home_end_frame=recorder.count, ticks=recorder.count)
+        brain.storage.event('home_completed', start=0, end=recorder.count)
+        persist()
+        base = env.data.xpos[env.arms["right"].base]
+        left = env.data.xpos[env.arms["left"].base] if env.dual else None
+        ruler = front_ruler(executor.obs.images["front"], env.data.camera("front"), base, left)
+        ruler.save(raw / "front_ruler.png")
+        reference = [({"view": "fixed metric ruler, front top plane, mm", "frame_id": executor.obs.frame_id,
+                       "top": "right Y", "bottom": "left Y" if env.dual else "right Y", "sides": "X"}, ruler)]
         for round_no in range(1, max_play_rounds + 1):
             if display and display.poll() is not None:
                 raise KeyboardInterrupt("GUI closed")
-            brain.decide(executor.obs, prompt, schemas, [])
+            brain.decide(executor.obs, prompt, schemas, [], reference_views=reference if round_no == 1 else ())
             call = brain.handoff()
             if call["name"] != "play":
                 raise RuntimeError("Expected a validated play during collection")
@@ -165,7 +185,7 @@ def run(seed, episodes, model_factory=ChatModel, *, root=Path("."), source="vist
     memory = root / "output/vista" / task
     vista_run = memory / data.name
     vista_run.mkdir(parents=True)
-    guide = memory / "guide.md"
+    guide = memory / "guide_track1.md"
     if not guide.exists():
         with guide.open("x", encoding="utf8") as f:
             f.write("暂无经过验证的经验。\n")
@@ -174,8 +194,11 @@ def run(seed, episodes, model_factory=ChatModel, *, root=Path("."), source="vist
     (vista_run / "system_prompt.txt").write_text(system_prompt, encoding="utf8")
     (vista_run / "guide_start.md").write_bytes(guide.read_bytes())
     entries = [dict(seed=n, status="planned", started=False) for n in range(seed, seed + episodes)]
-    manifest = dict(task=task, source=source, model=model.model, cameras=list(DUAL_CAMERAS if task == "sort" else CAMERAS),
+    manifest = dict(scene_version=SCENE_VERSION, task=task, source=source, model=model.model, cameras=list(DUAL_CAMERAS if task == "sort" else CAMERAS),
                     max_play_rounds=max_play_rounds, episodes=entries)
+
+    if hasattr(model, "options"):
+        manifest["request_options"] = dict(model.options)
 
     def persist():
         started = sum(e["started"] for e in entries)
@@ -192,6 +215,7 @@ def run(seed, episodes, model_factory=ChatModel, *, root=Path("."), source="vist
             display = launch_viewer(data) if gui else None
             for entry in entries:
                 brain = VistaBrain(run_dir=vista_run, system_prompt=system_prompt, settings=settings, model=model)
+                brain.storage.guide_filename = guide.name
                 try:
                     collect_episode(env, brain, data, entry, persist, source, display,
                                     max_play_rounds=max_play_rounds)

@@ -5,6 +5,9 @@ from contracts import JointPositions
 from control.interface import ArmControl
 
 
+HOME = JointPositions((-.0014, -.5422, .5084, 1.6046, 1.6181, .8))
+
+
 def move_to(arm: ArmControl, start: JointPositions, xyz, ticks):
     """Interpolate in joint space to the IK solution for a top-down tool pose."""
     goal = arm.solve_top_down(xyz, start.values[-1])

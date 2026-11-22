@@ -1,28 +1,15 @@
-<mujoco model="SO-101 right arm - Stack">
-  <include file="so101.xml"/>
-  <option timestep="0.002" iterations="50"/>
-  <statistic center="0.12 0 0.10" extent="0.43"/>
-  <visual>
-    <global offwidth="640" offheight="480"/>
-    <headlight ambient=".35 .35 .35" diffuse=".18 .18 .18"/>
-  </visual>
-  <asset>
-    <texture name="sky" type="skybox" builtin="gradient" rgb1=".22 .30 .36" rgb2=".68 .74 .76" width="256" height="1536"/>
-  </asset>
+<mujoco model="SO-101 Track 1 - stack">
+  <include file="table.xml"/>
   <worldbody>
-    <light pos=".25 -.4 .8" dir="0 0 -1" directional="true" castshadow="false"
-           diffuse=".58 .58 .58" specular=".03 .03 .03"/>
-    <camera name="front" pos=".210 -.37 .50" xyaxes="1 0 0 0 .789 .615" fovy="32"/>
-    <geom name="table" type="box" pos=".1 0 -.018" size=".42 .34 .018" rgba=".58 .64 .65 1"/>
-    <body name="red_cube" pos=".21 0 .015">
+    <body name="red_cube" pos=".48 .22 .015">
       <freejoint name="red_cube_free"/>
       <geom name="red_cube" type="box" size=".015 .015 .015" mass=".025"
-            friction="1 .005 .0001" solref=".008 1" rgba=".88 .055 .035 1"/>
+            friction="1 .005 .0001" solref=".008 1" material="red_block"/>
     </body>
-    <body name="green_cube" pos=".222 .03 .015">
+    <body name="green_cube" pos=".48 .22 .015">
       <freejoint name="green_cube_free"/>
       <geom name="green_cube" type="box" size=".015 .015 .015" mass=".025"
-            friction="1 .005 .0001" solref=".008 1" rgba=".06 .73 .17 1"/>
+            friction="1 .005 .0001" solref=".008 1" material="green_block"/>
     </body>
   </worldbody>
 </mujoco>

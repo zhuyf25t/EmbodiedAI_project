@@ -62,6 +62,7 @@ def _atomic_text(path: Path, text: str) -> None:
 class VistaStorage:
     def __init__(self, settings: VistaSettings, run_dir: Path):
         self.settings = settings
+        self.guide_filename = "guide.md"
         self.run_dir = run_dir.resolve()
         self.root = self.run_dir.parent
         self.joint_names, self.cameras = JOINT_NAMES, CAMERAS
@@ -79,7 +80,7 @@ class VistaStorage:
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             with self._guide_lock():
-                guide = self.root / "guide.md"
+                guide = self.root / self.guide_filename
                 if not guide.exists():
                     _atomic_text(guide, "暂无经过验证的经验。\n")
             with FileLock(self.root / ".episodes.lock"):
@@ -110,6 +111,7 @@ class VistaStorage:
         self.batch_count = 0
         self.active_batch_id = None
         self._records = []
+        self.decision_start_frame = 0
         self._last_owned_frame = None
         self._metadata = {"format_version": 3, "fps": CONTROL_HZ,
                           "state_fields": list(self.joint_names),
@@ -245,7 +247,7 @@ class VistaStorage:
         if kind not in ("guide", "working"):
             raise RuntimeError("VISTA 未知笔记类型")
         parent = self.root if kind == "guide" else self._episode()
-        path = parent / f"{kind}.md"
+        path = parent / (self.guide_filename if kind == "guide" else "working.md")
         if not path.is_file() or not path.resolve().is_relative_to(parent):
             raise RuntimeError(f"MEMORY_IO_ERROR: {kind}.md 丢失或路径已改变")
         return path
@@ -328,8 +330,7 @@ class VistaStorage:
         self._last_owned_frame = int(owned[-1][1:]) if owned else None
 
     def _validate_records(self, records: list[dict]) -> None:
-        expected_frame = 0
-        previous_end = 0
+        expected_frame = previous_end = self.decision_start_frame
         for index, record in enumerate(records, 1):
             required = {"batch_id", "tool_call_id", "frame_range", "actions", "observations", "execution_status"}
             if not required <= set(record) or set(record) - required - {"observation_error"}:

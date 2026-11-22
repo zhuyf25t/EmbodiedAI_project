@@ -4,14 +4,11 @@ import numpy as np
 
 
 class TwoCubes:
-    wrist_camera = "wrist_wide"
     colors = ("red", "green")
     dual = False
     max_steps = 300
     stable_ticks = 5
-    spawn_low = (.193, -.036)
-    spawn_high = (.237, .036)
-    min_separation = .046
+    carry_height = .075
 
     def __init__(self, model):
         self.cubes = {c: model.geom(c + "_cube").id for c in self.colors}
@@ -19,7 +16,7 @@ class TwoCubes:
         self.table = model.geom("table").id
         self.jaws = {}
         for arm in (("left", "right") if self.dual else ("right",)):
-            prefix = arm + "_" if self.dual else ""
+            prefix = arm + "_"
             for i in range(model.ngeom):
                 name = model.geom(i).name or ""
                 if model.geom_type[i] == mujoco.mjtGeom.mjGEOM_MESH:
@@ -32,14 +29,6 @@ class TwoCubes:
                 elif name.startswith(("moving_jaw_box", "moving_jaw_sph", "moving_jaw_so101_gripper_part")):
                     self.jaws[i] = (arm, "moving")
 
-    def reset(self, model, data, rng):
-        while True:
-            red, green = rng.uniform(self.spawn_low, self.spawn_high, (2, 2))
-            if np.max(np.abs(red - green)) >= self.min_separation:
-                break
-        for color, xy in zip(self.colors, (red, green)):
-            adr = self.joints[color].qposadr.item()
-            data.qpos[adr:adr + 2] = xy
         self.streak = 0
         self.last_time = None
 

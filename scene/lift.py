@@ -1,4 +1,4 @@
-"""Provisional tabletop layout; distances are metres in the right-arm base frame."""
+"""Lift with a rotated red cube and force-confirmed 50 mm bottom clearance."""
 from pathlib import Path
 
 import mujoco
@@ -10,30 +10,30 @@ class Lift:
     model_file = Path(__file__).parent / "assets" / "so101" / "lift.xml"
     max_steps = 120
     height_threshold = 0.05
-    # Provisional uniform reset area, aligned cube, until course coordinates arrive.
-    spawn_low = (0.205, -0.010)
-    spawn_high = (0.218, 0.010)
+    colors = ("red",)
+    carry_height = .075
 
     def __init__(self, model):
         self.cube = model.geom("red_cube").id
         self.table = model.geom("table").id
         self.free = model.joint("red_cube_free").qposadr.item()
+        self.cubes = {"red": self.cube}
+        self.joints = {"red": model.joint("red_cube_free")}
         # Only finger pads, tips and their collision meshes can certify a pinch.
         self.fixed_geoms = set()
         self.moving_geoms = set()
         for idx in range(model.ngeom):
             geom = model.geom(idx)
-            name = geom.name or ""
+            if not model.body(model.geom_bodyid[idx]).name.startswith("right_"):
+                continue
+            name = (geom.name or "").removeprefix("right_")
             mesh_id = model.geom_dataid[idx]
             if model.geom_type[idx] == mujoco.mjtGeom.mjGEOM_MESH:
-                name = model.mesh(mesh_id).name
+                name = model.mesh(mesh_id).name.removeprefix("right_")
             if name.startswith(("fixed_jaw_", "wrist_roll_follower_so101_gripper_part")):
                 self.fixed_geoms.add(idx)
             if name.startswith(("moving_jaw_box", "moving_jaw_sph", "moving_jaw_so101_gripper_part")):
                 self.moving_geoms.add(idx)
-
-    def reset(self, model, data, rng):
-        data.qpos[self.free:self.free + 2] = rng.uniform(self.spawn_low, self.spawn_high)
 
     def measure(self, model, data):
         # A rotated box's vertical half-extent is the sum of its projected half-axes.

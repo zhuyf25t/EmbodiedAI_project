@@ -8,6 +8,7 @@ import numpy as np
 
 JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
 CONTROL_HZ = 10
+SCENE_VERSION = "track1-v2"
 CAMERAS = ("wrist", "front")
 DUAL_CAMERAS = ("left_wrist", "right_wrist", "front")
 DUAL_JOINT_NAMES = tuple(f"{side}_{j}" for side in ("left", "right") for j in JOINT_NAMES)

@@ -7,7 +7,7 @@ import h5py
 import numpy as np
 from PIL import Image
 
-from contracts import CAMERAS, CONTROL_HZ, JOINT_NAMES
+from contracts import CAMERAS, CONTROL_HZ, JOINT_NAMES, SCENE_VERSION
 
 
 def save_json(path, obj):
@@ -31,12 +31,14 @@ class EpisodeRecorder:
         self.storage = storage
         self.tick_file = (directory / "ticks.jsonl").open("x", encoding="utf8", buffering=1)
         self.count = 0
+        self.phase = "home"
+        self.home_end_frame = 0
 
     def tick(self, before, target, after, diagnostics):
         if before.frame_no != self.count or after.frame_no != self.count + 1:
             raise RuntimeError("Discontinuous control frames")
         self.storage.ensure_frame(after)
-        row = dict(frame=before.frame_id, next_frame=after.frame_id, state=before.state.values,
+        row = dict(phase=self.phase, frame=before.frame_id, next_frame=after.frame_id, state=before.state.values,
                    action=target.values, judge_after=diagnostics)
         self.tick_file.write(json.dumps(row, allow_nan=False) + "\n")
         self.count += 1
@@ -52,7 +54,8 @@ class EpisodeRecorder:
         temp = path.with_suffix(".partial")
         with h5py.File(temp, "x") as h:
             h.attrs.update(task=task, prompt=prompt, seed=seed, fps=CONTROL_HZ, joint_names=json.dumps(self.joint_names),
-                           units=json.dumps((["rad"] * 5 + ["opening_0_1"]) * (len(self.joint_names) // 6)), source=source)
+                           units=json.dumps((["rad"] * 5 + ["opening_0_1"]) * (len(self.joint_names) // 6)), source=source,
+                           scene_version=SCENE_VERSION, home_end_frame=self.home_end_frame)
             h.create_dataset("action", data=np.asarray([r["action"] for r in rows], np.float32))
             h.create_dataset("observations/state", data=np.asarray([r["state"] for r in rows], np.float32))
             h.attrs["camera_names"] = json.dumps(self.cameras)
