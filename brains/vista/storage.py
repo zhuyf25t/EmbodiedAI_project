@@ -439,7 +439,7 @@ class VistaStorage:
         end = self.frames[self.current_frame_id]["frame_no"]
         if self._last_owned_frame == end:
             return
-        batch_id = self.begin_batch(end)
+        self.begin_batch(end)
         records = deepcopy(self._records)
         records[-1]["execution_status"] = "interrupted" if stop_code == "interrupted" else "finished"
         self._commit_records(records, None)

@@ -5,11 +5,5 @@ tmp/
 data/
 output/
 
-# Local training workspace
-/act/
-/evaluation/
-/requirements-act.txt
-/tests/test_act_contract.py
-
 # Unreferenced mesh from the upstream model checkout
 /scene/assets/so101/assets/wrist_roll_follower_so101_gripper_v1.stl

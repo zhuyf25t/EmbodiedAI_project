@@ -21,7 +21,8 @@ class TaskVideo:
     def __init__(self, path, cameras):
         self.cameras = tuple(cameras)
         self.writer = imageio_ffmpeg.write_frames(str(path), (480*len(cameras), 432), fps=CONTROL_HZ,
-                                                 codec="libx264", macro_block_size=1)
+                                                 codec="libx264", macro_block_size=1,
+                                                 output_params=["-threads", "1"])
         self.writer.send(None)
         self.font = ImageFont.load_default(size=16)
 

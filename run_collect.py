@@ -21,13 +21,10 @@ from collection.recorder import EpisodeRecorder, export_demo, save_json
 from contracts import DUAL_JOINT_NAMES, JOINT_NAMES, ObservationWindow, SCENE_VERSION
 from control.vista import action_schemas, ArmExecutor
 from scene.env import TabletopEnv
-from scene.lift import Lift
 from scene.front_ruler import front_ruler, sample_marks
-from scene.stack import Stack
-from scene.sort import Sort
+from scene.tasks import TASKS
 from scene.live_view import launch_viewer
 
-TASKS = {"lift": Lift, "stack": Stack, "sort": Sort}
 MAX_PLAY_ROUNDS = 20
 
 
@@ -173,6 +170,15 @@ def provider_config(model):
                 api="responses" if getattr(model, "responses", False) else "chat_completions")
 
 
+def same_provider(a, b):
+    # A run can compare reasoning efforts; each new attempt records its own setting.
+    def fixed(config):
+        options = dict(config["request_options"])
+        options.pop("reasoning_effort", None)
+        return {**config, "request_options": options}
+    return fixed(a) == fixed(b)
+
+
 def publish(data, task, entry):
     seed = entry["seed"]
     raw = attempt_path(data, task, seed, entry["attempt"]) / "raw"
@@ -252,8 +258,10 @@ def record_job(data, task, seed, operation, expected, model_factory=ChatModel, d
         model = None
         try:
             model = model_factory()
-            if provider_config(model) != manifest["provider"]:
+            entry["provider"] = provider_config(model)
+            if not same_provider(entry["provider"], manifest["provider"]):
                 raise ValueError("Model configuration differs from the batch")
+            persist()
             with TabletopEnv(TASKS[task]) as env:
                 brain = VistaBrain(run_dir=folder, system_prompt=(folder / "system_prompt.txt").read_text("utf8"),
                                    settings=VistaSettings.from_env(), model=model)
@@ -311,7 +319,7 @@ def run_batch(args, *, root=Path("."), model_factory=ChatModel):
             queue = [(task, seed, op, len(manifest["tasks"][task]["episodes"][str(seed)]))
                      for task, seed, op in jobs(data, manifest, args.fix)]
             if any(op == "record" for _, _, op, _ in queue):
-                if current_provider() != manifest["provider"]:
+                if not same_provider(current_provider(), manifest["provider"]):
                     raise ValueError("Use the model and request options recorded in manifest.json")
                 for task, spec in manifest["tasks"].items():
                     if file_hash(logs / task / "system_prompt.txt") != spec["prompt_sha256"]:

@@ -1,6 +1,6 @@
-# SO-101 · MuJoCo · VISTA 示范采集
+# SO-101 · MuJoCo · VISTA 示范采集与 ACT 训练
 
-右臂抬红块（Lift）、右臂把红块叠到绿块上（Stack）、双臂分拣（Sort）。三个任务共用一张桌子、两台 SO-101 和一套 10 Hz 控制接口。VISTA 根据相机画面和手臂状态操作，采集器保存每拍的观测与关节目标，并把成功示范导出为 HDF5。
+右臂抬红块（Lift）、右臂把红块叠到绿块上（Stack）、双臂分拣（Sort）。三个任务共用一张桌子、两台 SO-101 和一套 10 Hz 控制接口。VISTA 根据相机画面和手臂状态操作，采集器保存每拍的观测与关节目标，并把成功示范导出为 HDF5。ACT 从这些示范学习，每个任务独立训练一份策略。
 
 ## 先看三个场景
 
@@ -41,7 +41,7 @@ Stack 和 Sort 都要求上述条件以及低线速度、低角速度连续满�
 
 ## 用 VISTA 录制
 
-在仓库根目录把 `.env.example` 复制成 `.env` 并填写密钥。使用 DeepSeek 时填写 `DEEPSEEK_API_KEY`。使用官方 OpenAI SOL 时填写 `OPENAI_BASE_URL=https://api.openai.com/v1`、`OPENAI_MODEL=gpt-6.2-sol`、`OPENAI_REASONING_EFFORT=xhigh` 和 `OPENAI_API_KEY`。SOL 通过 Responses API 接收多相机图像和工具回执。
+在仓库根目录把 `.env.example` 复制成 `.env` 并填写密钥。使用 DeepSeek 时填写 `DEEPSEEK_API_KEY`。使用官方 OpenAI SOL 时填写 `OPENAI_BASE_URL=https://api.openai.com/v1`、`OPENAI_MODEL=gpt-6.2-sol`、推理档位 `OPENAI_REASONING_EFFORT` 和 `OPENAI_API_KEY`。SOL 通过 Responses API 接收多相机图像和工具回执。
 
 ```bash
 # 新建具名批次。三个任务各规划 seed 0–9，共用 10 个 worker
@@ -69,7 +69,7 @@ python run_collect.py --out preview --task lift --seed 0 --episodes 1 --gui
 | `--add N` | 从清单已登记的最大 seed 后追加 N 个新 seed，所有任务一起扩容，包括此前已有失败 seed 的任务。 |
 | `--fix` | 调度尚未尝试的 seed，以及进程退出或模型异常中断的 seed。每次重跑从同一个 seed 的随机初姿开始，建立独立的 attempt。可与 `--add` 同用。 |
 
-续录继承批次的任务、模型设置、任务提示和 play 上限。若一次扩容执行到一半退出，用 `--resume NAME --fix` 接续；再次传 `--add N` 表示另外新增 N 个 seed。达到 play 上限属于一次已完成的策略试验，成功或正常失败的 seed 都跳过。每个 seed 的首次实际录制叫 `attempt_01`，手动 `--fix` 重新启动该 seed 才会产生下一个编号。单局内重试模型请求沿用当前 attempt。局末复盘错误保留在已完成的记录中。若物理任务已经成功而 HDF5 导出失败，`--fix` 从该次 raw 重建文件。遇到已有文件与记录不一致时会报错并保留现场。
+续录继承批次的任务、模型、任务提示和 play 上限。可以在追加示范前调整 `OPENAI_REASONING_EFFORT`；新尝试在 `provider.request_options` 中记录实际设置，旧记录沿用创建批次时的设置。若一次扩容执行到一半退出，用 `--resume NAME --fix` 接续；再次传 `--add N` 表示另外新增 N 个 seed。达到 play 上限属于一次已完成的策略试验，成功或正常失败的 seed 都跳过。每个 seed 的首次实际录制叫 `attempt_01`，手动 `--fix` 重新启动该 seed 才会产生下一个编号。单局内重试模型请求沿用当前 attempt。局末复盘错误保留在已完成的记录中。若物理任务已经成功而 HDF5 导出失败，`--fix` 从该次 raw 重建文件。遇到已有文件与记录不一致时会报错并保留现场。
 
 ## 数据、经验和回放
 
@@ -113,7 +113,7 @@ python -m scene.review_tabletop data/run01/sort --seed 0 --attempt 2 --replay
 
 ## 三个任务的实际录制结果
 
-批次 `run01` 使用 SOL xhigh，每局上限 24 轮 play，三个任务各跑 seed 0–9。
+以下是批次 `run01` 的首批 seed 0–9。三个任务都使用 SOL xhigh，每局最多 24 轮 play。
 
 | 任务 | 首试成功 | 补录 | 已保存示范 |
 | --- | ---: | ---: | ---: |
@@ -121,7 +121,9 @@ python -m scene.review_tabletop data/run01/sort --seed 0 --attempt 2 --replay
 | Stack | 10/10 | — | 10 |
 | Sort | 3/10 | 7/7 | 10 |
 
-Sort 首轮有 7 局在动作期间收到 HTTP 429，原记录保存在对应 seed 的 `attempt_01`。双并发补录成功的 7 局保存在 `attempt_02`。该任务一共启动 17 次，10 个 seed 最终都有示范。
+Sort 首轮有 7 局在动作期间收到 HTTP 429，原记录保存在对应 seed 的 `attempt_01`。双并发补录成功的 7 局保存在 `attempt_02`。在 seed 0–9 上，Sort 一共启动 17 次，10 个 seed 最终都有示范。
+
+同一批次的 seed 10–19 使用 SOL high、5 个并发 worker 和相同的 24 轮上限。Lift、Stack 首试各成功 10/10。Sort 首试成功 7/10，seed 14 首次遇到 HTTP 429，补录在第 23 轮成功；seed 16 和 18 用满 24 轮，按策略失败保留。新增示范共 28 条。全批次可训练的 HDF5 为 Lift 20 条、Stack 20 条、Sort 18 条。
 
 ## 控制与模型工具
 
@@ -131,6 +133,52 @@ Sort 首轮有 7 局在动作期间收到 HTTP 429，原记录保存在对应 se
 
 Stack 的 `mark_span` 只对 VISTA 选择的四个毫米边界取中点。
 
+## 在 GPU 上训练 ACT
+
+从仓库根目录运行。`--out run01 --task lift` 读取 `data/run01/manifest.json` 和 `data/run01/lift/`，权重写入 `output/act/run01/lift/`。换一个任务名，就会在同一实验下独立训练该任务的权重。
+
+```bash
+python -m pip install -r requirements-act.txt
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python -m act.train --out run01 --task lift
+python -m act.train --out run01 --task stack
+python -m act.train --out run01 --task sort
+```
+
+训练需要 CUDA 版 PyTorch 和匹配的 torchvision，第二条命令应输出 `True`。初次训练使用 torchvision 的 ImageNet ResNet-18 权重，空缓存的机器首次启动时需要能下载权重。租用 GPU 时携带项目代码及完整的 `data/run01/` 即可。
+
+| 参数 | 默认值与用途 |
+| --- | --- |
+| `--data` | `data/<out>`。若想用同一批示范另开实验，可用 `--out experiment2 --data data/run01`。 |
+| `--epochs` / `--batch-size` | 100 / 8。续训时 epochs 表示总轮数，batch size 沿用初次训练的值。 |
+| `--workers` | 2。每个数据加载器用于读取 HDF5 和缩放相机图像的进程数，0 表示在训练进程中读取。 |
+| `--resume` | 从同名任务实验的 `last.pt` 续训。实验目录已存在时，新训练需要另取名字。 |
+
+```bash
+python -m act.train --out run01 --task lift --resume --epochs 150
+```
+
+模型使用共享的 ResNet-18 逐相机编码图像，将实测关节状态和 CVAE 潜变量送入 Transformer，一次预测 32 拍关节目标。Lift 和 Stack 用两路相机、6 维目标；Sort 用三路相机、按左臂再右臂排列的 12 维目标。每局的回位拍也参与监督。
+
+每次新训练从已成功导出的示范中按**整局**留约 20% 验证。按 seed 排序后分段固定抽样，让验证集覆盖较早和较晚采集的局。训练集单独计算关节状态与动作的归一化统计。动作片段到本局末尾即填充，填充位置不计入 L1。每轮在留出集上计算 `L1 + 10 × KL`，固定验证的潜变量抽样，按最低验证损失选 `best.pt`，平分取较早轮次。真实执行时潜变量取零。任务成功率须另做闭环评估。[ACT 原论文与示意图](https://tonyzhaozh.github.io/aloha/) · [作者的损失实现](https://github.com/tonyzhaozh/act/blob/main/policy.py)
+
+`output/act/run01/<task>/` 中的 `training_data.json` 保存训练与验证 seed、相对路径、哈希和归一化统计，`epoch_*.json` 保存两组的 L1、KL 与总损失，`best.pt` 用于推理，`last.pt` 同时保存优化器和随机状态。续训读取初次保存的清单并核对哈希；想纳入后来补录的示范时，使用新的实验名。
+
+## 评估 best.pt
+
+在 MuJoCo 里从随机初姿闭环执行 ACT，并为每个测试 seed 保存同步相机录像。准备好 `output/act/run01/lift/best.pt`，从项目根目录运行。独立的评估机器只需要项目代码、依赖和该权重。无窗口 Linux 可先设置 `MUJOCO_GL=egl`。
+
+```bash
+python -m pip install -r requirements-act.txt -r requirements.txt
+python -m evaluation.rollout --out run01 --task lift
+```
+
+把 `lift` 换成 `stack` 或 `sort` 即可评估对应的权重。默认从 seed 1000 到 1099（含两端），共 100 局、100 个 MP4，最多 10 个仿真进程共享一个批量推理模型。有 CUDA 时使用 GPU 推理。小规模试跑可用 `--seed 1000 --episodes 5 --threads 2`。测试 seed 与权重记录的训练或验证 seed 重合时会报错。
+
+每局从第 0 帧的随机臂姿开始，由 ACT 自己完成回位。从实测关节与原始相机图像预测动作，执行训练协议指定的前 8 拍，再观察并重新预测。每个 10 Hz 控制拍调用该场景自己的裁判，成功立即结束。Lift 最多 120 拍，Stack 和 Sort 最多 300 拍。当前 Sort 的成功示范中，seed 10 和 14 分别用了 336 和 408 拍，超过这项评估的 30 秒时限。
+
+每次评估都在 `output/eval/<out>/<task>/seeds-<首>-<尾>-<唯一编号>/` 新建目录。每局保存 `seed-1000-success.mp4` 或 `seed-1000-failure.mp4` 和对应的 `seed-1000.json`，后者含实际关节目标与逐拍裁判结果。录像从初始帧录到终态，帧数等于控制拍数加一。全部 seed 完成后才写 `summary.json`，给出成功数、总局数、成功率、逐局结果、录像文件名和权重 SHA-256。中断时已完成的局保留在本次评估目录。
+
 ## 仓库文件
 
 ```text
@@ -138,15 +186,22 @@ Stack 的 `mark_span` 只对 VISTA 选择的四个毫米边界取中点。
 requirements.txt        contracts.py          run_collect.py
 control/                SO-101 接口、MuJoCo 执行器、动作、夹持与稳定性判定
 scene/                  桌面与相机、Lift / Stack / Sort、GUI、自检与回放
+  tasks.py              采集与闭环评估共用的任务注册表
   assets/so101/         XML、两张方块贴图、18 个模型网格、来源与许可
 brains/vista/           决策图、模型适配、工具、经验与文件锁
   prompts/              lift.txt、stack.txt、sort.txt
+act/                    数据、模型、离线训练与验证、并行推理与仿真 worker
+evaluation/rollout.py   从 best.pt 运行闭环测试并逐局录像
+requirements-act.txt    GPU 训练依赖
 collection/
   batch.py              具名批次、seed、尝试记录与调度规则
   recorder.py           逐拍记录和 HDF5 发布
 tests/
   test_collection_batch.py
   test_tabletop_tasks.py
+  test_act_contract.py
+  test_act_training.py
+  test_act_rollout.py
 ```
 
-运行 `python -m unittest discover -s tests -p "test_collection_batch.py"` 可以在临时目录、使用离线模型验证续录、扩容、补录和导出。运行 `python -m unittest discover -s tests -p "test_tabletop_tasks.py"` 可验证场景和控制边界。实际数据、在线日志、API 密钥及本地训练代码都由 Git 忽略。
+运行 `python -m unittest discover -s tests -p "test_collection_batch.py"` 可以在临时目录、使用离线模型验证续录、扩容、补录和导出。运行 `python -m unittest discover -s tests -p "test_tabletop_tasks.py"` 可验证场景和控制边界。安装两份依赖后，`python -m unittest discover -s tests -v` 可运行完整测试，含真实 MuJoCo 环境的多进程评估与逐帧视频校验。实际数据、权重、在线日志及 API 密钥均保存在本地。

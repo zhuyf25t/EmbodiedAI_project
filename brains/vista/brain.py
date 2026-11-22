@@ -13,7 +13,7 @@ from contracts import FrameObservation, ObservationWindow
 
 from .base import Brain, Decision
 from .graph import build_graph
-from .model import ChatModel, image_message
+from .model import image_message
 from .settings import VistaSettings
 from .state import (VistaState, batch_status,
                     check_current_round_results, validate_reply, calls_of)
@@ -25,7 +25,7 @@ class VistaBrain(Brain):
     name = "vista"
     gui_realtime = True
 
-    def __init__(self, *, run_dir, system_prompt, settings, model):
+    def __init__(self, *, run_dir, system_prompt, settings: VistaSettings, model):
         self.settings = settings
         self.max_model_calls = settings.max_model_calls
         self.storage = VistaStorage(settings, Path(run_dir))

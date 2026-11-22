@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage
 
 from brains.vista.file_lock import FileLock
 from collection.batch import attempt_path, file_hash, logs_for, read_manifest, save_attempt
-from run_collect import parse_args, run_batch
+from run_collect import parse_args, run_batch, same_provider
 
 
 class OfflineModel:
@@ -44,6 +44,15 @@ class CollectionBatchTest(unittest.TestCase):
 
     def collect(self, arguments, model=OfflineModel):
         return run_batch(parse_args(arguments.split()), root=self.root, model_factory=model)
+
+    def test_resume_can_change_reasoning_effort_and_keeps_other_provider_options(self):
+        before = dict(model="m1", api="responses", request_options={"reasoning_effort": "xhigh", "temperature": 0.1})
+        after = {**before, "request_options": {"reasoning_effort": "high", "temperature": 0.1}}
+        self.assertTrue(same_provider(before, after))
+        self.assertFalse(same_provider(before, {**after, "model": "m2"}))
+        self.assertFalse(same_provider(before, {**after, "api": "chat_completions"}))
+        self.assertFalse(same_provider(before, {**after, "request_options": {"temperature": 0.2}}))
+        self.assertEqual(before["request_options"]["reasoning_effort"], "xhigh")
 
     def test_resume_add_fix_and_parallel_task_isolation(self):
         with self.assertRaises(RuntimeError):
