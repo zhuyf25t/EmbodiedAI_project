@@ -41,13 +41,13 @@ class VistaBrain(Brain):
         self._closed = False
         self.decision_round = 0
 
-    def begin_episode(self, ep_dir, task_text, tool_schemas, *, episode_name=None, ruler_reader=None, mark_spans=False):
+    def begin_episode(self, ep_dir, task_text, tool_schemas, *, episode_name=None, attempt=None, ruler_reader=None, mark_spans=False):
         if self._active or self._closed:
             raise RuntimeError("VISTA 必须结束上一 episode，且不能复用已关闭的 brain")
         if not isinstance(task_text, str) or not task_text.strip():
             raise RuntimeError("VISTA 任务描述不能为空")
         self.tools = VistaTools(self.storage, self.settings, tool_schemas, ruler_reader=ruler_reader, mark_spans=mark_spans)
-        self.storage.begin_episode(Path(ep_dir), task_text, episode_name=episode_name)
+        self.storage.begin_episode(Path(ep_dir), task_text, episode_name=episode_name, attempt=attempt)
         self._guide_revision = None
         self.state = {"messages": [], "model_calls": 0}
         self.task_text = task_text

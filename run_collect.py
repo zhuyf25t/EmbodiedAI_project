@@ -1,16 +1,24 @@
 """Collect a seeded batch of tabletop demonstrations with VISTA."""
 import argparse
-import json
+import sys
+import time
+from tempfile import TemporaryDirectory
+from contextlib import ExitStack
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 
 from brains.vista.brain import VistaBrain
+from brains.vista.file_lock import FileLock
 from brains.vista.model import ChatModel
 from brains.vista.settings import VistaSettings
 from brains.vista.state import action_result, batch_status
-from collection.recorder import EpisodeRecorder, save_json
-from contracts import DUAL_CAMERAS, CAMERAS, ObservationWindow, SCENE_VERSION
+from collection.batch import (attempt_path, batch_name, extend, file_hash, jobs, logs_for,
+                              new_manifest, read_manifest, save_attempt, write_manifest)
+from collection.recorder import EpisodeRecorder, export_demo, save_json
+from contracts import DUAL_JOINT_NAMES, JOINT_NAMES, ObservationWindow, SCENE_VERSION
 from control.vista import action_schemas, ArmExecutor
 from scene.env import TabletopEnv
 from scene.lift import Lift
@@ -64,15 +72,14 @@ def execute_batch(brain, executor, actions, call):
         executor.tick = saved_tick
 
 
-def collect_episode(env, brain, data_dir, entry, persist, source, display=None, *, max_play_rounds=MAX_PLAY_ROUNDS):
+def collect_episode(env, brain, data, entry, persist, display, max_play_rounds):
     seed = entry["seed"]
     ep = f"ep_{seed:04d}"
-    raw = data_dir / "raw" / ep
-    raw.mkdir(parents=True)
+    task = type(env.task).__name__.lower()
+    raw = attempt_path(data, task, seed, entry["attempt"]) / "raw"
     obs, initial = env.reset(seed=seed, finish_on_success=False, limit_ticks=False)
     entry.update(status="running", started=True, success=False, ticks=0, play_rounds=0)
     persist()
-    task = type(env.task).__name__.lower()
     schemas = action_schemas(env.dual)
     brain.storage.joint_names, brain.storage.cameras = env.joint_names, env.camera_names
     prompt = obs.prompt
@@ -80,7 +87,7 @@ def collect_episode(env, brain, data_dir, entry, persist, source, display=None, 
         return sample_marks(photo, env.data.camera("front"), env.data.xpos[env.arms[side].base], x_mm, y_mm, step_mm, plane_mm,
                             include_crop=(task == 'stack'))
 
-    brain.begin_episode(raw, prompt, schemas, episode_name=ep, ruler_reader=ruler_reader, mark_spans=(task == 'stack'))
+    brain.begin_episode(raw, prompt, schemas, episode_name=ep, attempt=entry["attempt"], ruler_reader=ruler_reader, mark_spans=(task == 'stack'))
     brain.storage.ensure_frame(obs)
     save_json(raw / "reset.json", dict(seed=seed, frame=obs.frame_id, judge=initial))
     recorder = EpisodeRecorder(raw, brain.storage, env.joint_names, env.camera_names)
@@ -127,11 +134,10 @@ def collect_episode(env, brain, data_dir, entry, persist, source, display=None, 
         # Fix the physical outcome and publish the training data before optional reflection.
         recorder.close()
         entry.update(status="finished", success=reason == "success", reason=reason, ticks=recorder.count)
+        persist()  # A finished physical trial can be exported offline after a crash.
         if entry["success"]:
-            h5 = data_dir / "episodes" / (ep + ".h5")
             try:
-                recorder.export(h5, task, prompt, seed, source)
-                entry["hdf5"] = h5.relative_to(data_dir).as_posix()
+                publish(data, task, entry)
             except Exception as error:
                 entry["export_error"] = str(error)
         persist()
@@ -162,88 +168,223 @@ def collect_episode(env, brain, data_dir, entry, persist, source, display=None, 
         persist()
 
 
-def create_run(root):
-    root.mkdir(parents=True, exist_ok=True)
-    i = 1
-    while True:
-        path = root / f"run{i:02d}"
+def provider_config(model):
+    return dict(model=model.model, request_options=getattr(model, "options", {}),
+                api="responses" if getattr(model, "responses", False) else "chat_completions")
+
+
+def publish(data, task, entry):
+    seed = entry["seed"]
+    raw = attempt_path(data, task, seed, entry["attempt"]) / "raw"
+    path = data / task / f"ep_{seed:04d}.h5"
+    if path.exists() and entry.get("sha256") and file_hash(path) != entry["sha256"]:
+        raise ValueError(f"Existing HDF5 checksum differs: {path}")
+    names = DUAL_JOINT_NAMES if task == "sort" else JOINT_NAMES
+    cameras = read_manifest(data)["tasks"][task]["cameras"]
+    export_demo(raw, path, task, TASKS[task].prompt, entry, names, cameras)
+    entry.update(hdf5=path.relative_to(data).as_posix(), sha256=file_hash(path))
+    entry.pop("export_error", None)
+
+
+def initialize(data, tasks, seeds, max_play, provider):
+    logs = logs_for(data)
+    if data.exists() or logs.exists():
+        raise FileExistsError(f"Batch already exists: {data.name}. Use --resume.")
+    manifest = new_manifest(data.name, tasks, seeds, max_play, provider)
+    with TemporaryDirectory(dir=data.parent) as d, TemporaryDirectory(dir=logs.parent) as v:
+        staged_data, staged_logs = Path(d) / "data", Path(v) / "logs"
+        for task in tasks:
+            (staged_data / task).mkdir(parents=True)
+            folder = staged_logs / task
+            folder.mkdir(parents=True)
+            template = Path(__file__).parent / "brains/vista/prompts" / f"{task}.txt"
+            prompt_file = folder / "system_prompt.txt"
+            prompt_file.write_text(template.read_text("utf8").replace("{max_play_rounds}", str(max_play)), "utf8")
+            manifest["tasks"][task]["prompt_sha256"] = file_hash(prompt_file)
+            for name in ("guide.md", "guide_start.md"):
+                (folder / name).write_text("暂无经过验证的经验。\n", "utf8")
+        write_manifest(staged_data, manifest)
+        staged_logs.rename(logs)
         try:
-            path.mkdir()
-            return path
-        except FileExistsError:
-            i += 1
+            staged_data.rename(data)
+        except BaseException:
+            logs.rename(staged_logs)
+            raise
 
 
-def run(seed, episodes, model_factory=ChatModel, *, root=Path("."), source="vista", gui=False,
-        max_play_rounds=MAX_PLAY_ROUNDS, task="lift"):
-    if type(max_play_rounds) is not int or max_play_rounds < 1:
-        raise ValueError("max_play_rounds must be a positive integer")
-    settings = VistaSettings.from_env()
-    model = model_factory()
-    data = create_run(root / "data" / task)
-    (data / "episodes").mkdir()
-    memory = root / "output/vista" / task
-    vista_run = memory / data.name
-    vista_run.mkdir(parents=True)
-    guide = memory / "guide_track1.md"
-    if not guide.exists():
-        with guide.open("x", encoding="utf8") as f:
-            f.write("暂无经过验证的经验。\n")
-    template = (Path(__file__).parent / "brains/vista/prompts" / f"{task}.txt").read_text("utf8")
-    system_prompt = template.replace("{max_play_rounds}", str(max_play_rounds))
-    (vista_run / "system_prompt.txt").write_text(system_prompt, encoding="utf8")
-    (vista_run / "guide_start.md").write_bytes(guide.read_bytes())
-    entries = [dict(seed=n, status="planned", started=False) for n in range(seed, seed + episodes)]
-    manifest = dict(scene_version=SCENE_VERSION, task=task, source=source, model=model.model, cameras=list(DUAL_CAMERAS if task == "sort" else CAMERAS),
-                    max_play_rounds=max_play_rounds, episodes=entries)
+def record_job(data, task, seed, operation, expected, model_factory=ChatModel, display=None):
+    folder = logs_for(data) / task
+    # An orphan worker can outlive its coordinator. Never claim its seed twice.
+    with ExitStack() as locks:
+        try:
+            locks.enter_context(FileLock(folder / f".ep_{seed:04d}.lock", timeout=0))
+        except BlockingIOError:
+            return "already running"
+        manifest = read_manifest(data)
+        attempts = manifest["tasks"][task]["episodes"][str(seed)]
+        if len(attempts) != expected:
+            return "already claimed"
+        if attempts and attempts[-1]["status"] == "finished" and operation == "record":
+            return "already finished"
+        if operation == "export":
+            entry = attempts[-1]
+            try:
+                publish(data, task, entry)
+            except Exception as error:
+                entry["export_error"] = str(error)
+                raise
+            finally:
+                save_attempt(data, task, entry)
+            return "exported from raw"
+        if attempts and attempts[-1]["status"] == "running":
+            stale = attempts[-1]
+            stale.update(status="interrupted", reason="worker stopped before finalization")
+            save_attempt(data, task, stale)
+        if (data / task / f"ep_{seed:04d}.h5").exists():
+            raise FileExistsError(f"Unclaimed demonstration already exists for {task} seed {seed}")
+        entry = dict(seed=seed, attempt=expected+1, started=True, started_ns=time.time_ns(),
+                     status="running", success=False, ticks=0, play_rounds=0)
 
-    if hasattr(model, "options"):
-        manifest["request_options"] = dict(model.options)
+        def persist():
+            save_attempt(data, task, entry)
 
-    def persist():
-        started = sum(e["started"] for e in entries)
-        succeeded = sum(e.get("success", False) for e in entries)
-        manifest["summary"] = dict(planned=len(entries), started=started, success=succeeded,
-            interrupted=sum(e["status"] == "interrupted" for e in entries),
-            exported=sum("hdf5" in e for e in entries), success_rate=succeeded / started if started else None)
-        save_json(data / "manifest.json", manifest)
-
-    persist()
-    print(f"{data}  model={model.model}  seeds={seed}..{seed + episodes - 1}", flush=True)
-    try:
-        with TabletopEnv(TASKS[task]) as env:
-            display = launch_viewer(data) if gui else None
-            for entry in entries:
-                brain = VistaBrain(run_dir=vista_run, system_prompt=system_prompt, settings=settings, model=model)
-                brain.storage.guide_filename = guide.name
-                try:
-                    collect_episode(env, brain, data, entry, persist, source, display,
-                                    max_play_rounds=max_play_rounds)
-                except Exception as error:
-                    if entry["status"] != "finished":
-                        entry.update(status="interrupted", reason=str(error))
-                    persist()
-                    print(f"seed {entry['seed']}: {error}", flush=True)
-                    # Systemic API/configuration failures should not consume the rest of a batch.
-                    raise
-                print(f"seed {entry['seed']}: {entry['reason']}, {entry['ticks']} ticks", flush=True)
-    finally:
-        (vista_run / "guide_end.md").write_bytes(guide.read_bytes())
-        model.close()
         persist()
-    print(json.dumps(manifest["summary"]), flush=True)
+        model = None
+        try:
+            model = model_factory()
+            if provider_config(model) != manifest["provider"]:
+                raise ValueError("Model configuration differs from the batch")
+            with TabletopEnv(TASKS[task]) as env:
+                brain = VistaBrain(run_dir=folder, system_prompt=(folder / "system_prompt.txt").read_text("utf8"),
+                                   settings=VistaSettings.from_env(), model=model)
+                collect_episode(env, brain, data, entry, persist, display, manifest["max_play_rounds"])
+            if entry.get("export_error"):
+                raise RuntimeError(entry["export_error"])
+        except BaseException as error:
+            if entry["status"] != "finished":
+                entry.update(status="interrupted", reason=str(error) or type(error).__name__)
+            evidence = attempt_path(data, task, seed, entry["attempt"])
+            evidence.mkdir(parents=True, exist_ok=True)
+            if not (evidence / "outcome.json").exists():
+                save_json(evidence / "outcome.json", entry)
+            raise
+        finally:
+            persist()
+            if model is not None:
+                model.close()
+        return entry["reason"]
+
+
+def run_batch(args, *, root=Path("."), model_factory=ChatModel):
+    data = root.resolve() / "data" / (args.out or args.resume)
+    logs = logs_for(data)
+    data.parent.mkdir(parents=True, exist_ok=True)
+    locks = logs.parent / ".locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    with FileLock(locks / (data.name + ".lock"), timeout=0):
+        provider = None
+
+        def current_provider():
+            nonlocal provider
+            if provider is None:
+                client = model_factory()
+                try:
+                    provider = provider_config(client)
+                finally:
+                    client.close()
+            return provider
+
+        if args.out:
+            if data.exists() or logs.exists():
+                raise FileExistsError(f"Batch already exists: {data.name}. Use --resume.")
+            start = args.seed if args.seed is not None else 0
+            initialize(data, args.task, range(start, start + (args.episodes or 1)),
+                       args.max_play_rounds or MAX_PLAY_ROUNDS, current_provider())
+        if not (data / "manifest.json").is_file() or not logs.is_dir():
+            raise FileNotFoundError(f"Missing collection or VISTA directory for {data.name}")
+        with FileLock(logs / ".manifest.lock"):
+            manifest = read_manifest(data)
+            if manifest["scene_version"] != SCENE_VERSION:
+                raise ValueError("Scene version differs from the batch")
+            if args.add:
+                extend(manifest, args.add)
+            queue = [(task, seed, op, len(manifest["tasks"][task]["episodes"][str(seed)]))
+                     for task, seed, op in jobs(data, manifest, args.fix)]
+            if any(op == "record" for _, _, op, _ in queue):
+                if current_provider() != manifest["provider"]:
+                    raise ValueError("Use the model and request options recorded in manifest.json")
+                for task, spec in manifest["tasks"].items():
+                    if file_hash(logs / task / "system_prompt.txt") != spec["prompt_sha256"]:
+                        raise ValueError(f"Saved {task} system prompt has changed")
+            if args.add:
+                write_manifest(data, manifest)
+        print(f"{data}: {len(queue)} scheduled, {args.threads} worker(s)", flush=True)
+        if not queue:
+            return data
+        errors = []
+        viewers = {}
+        if args.threads == 1:
+            for task, seed, op, count in queue:
+                if args.gui and op == "record" and task not in viewers:
+                    viewers[task] = launch_viewer(data / task)
+                try:
+                    result = record_job(data, task, seed, op, count, model_factory, viewers.get(task))
+                    print(f"{task} seed {seed}: {result}", flush=True)
+                except Exception as error:
+                    errors.append(f"{task} seed {seed}: {error}")
+                    print(errors[-1], flush=True)
+                    if not args.fix:
+                        break  # A provider failure leaves later seeds queued for resume.
+        else:
+            with ProcessPoolExecutor(max_workers=args.threads, mp_context=get_context("spawn")) as pool:
+                futures = {pool.submit(record_job, data, *job, model_factory): job[:2] for job in queue}
+                for future in as_completed(futures):
+                    task, seed = futures[future]
+                    try:
+                        print(f"{task} seed {seed}: {future.result()}", flush=True)
+                    except Exception as error:
+                        errors.append(f"{task} seed {seed}: {error}")
+                        print(errors[-1], flush=True)
+        for task in manifest["tasks"]:
+            folder = logs / task
+            with FileLock(folder / ".guide.lock"):
+                (folder / "guide_end.md").write_bytes((folder / "guide.md").read_bytes())
+        if errors:
+            raise RuntimeError(f"{len(errors)} job(s) reported errors. See {data/'manifest.json'}")
     return data
 
 
-if __name__ == "__main__":
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--task", choices=TASKS, required=True)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--episodes", type=int, default=1)
-    parser.add_argument("--max-play-rounds", type=int, default=MAX_PLAY_ROUNDS,
-                        help="Maximum play calls per episode (default: 20)")
-    parser.add_argument("--gui", action="store_true", help="Show all synchronized task cameras")
-    args = parser.parse_args()
-    if args.seed < 0 or args.episodes < 1 or args.max_play_rounds < 1:
-        parser.error("seed must be nonnegative; episodes and max-play-rounds must be positive")
-    run(args.seed, args.episodes, gui=args.gui, task=args.task, max_play_rounds=args.max_play_rounds)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--out", type=batch_name, metavar="NAME", help="Create a named batch")
+    mode.add_argument("--resume", type=batch_name, metavar="NAME", help="Continue an existing batch")
+    parser.add_argument("--task", choices=TASKS, nargs="+", help="Tasks for a new batch")
+    parser.add_argument("--seed", type=int, help="First seed (default 0)")
+    parser.add_argument("--episodes", type=int, help="Seeds per task (default 1)")
+    parser.add_argument("--max-play-rounds", type=int, help="Play limit for a new batch (default 20)")
+    parser.add_argument("--threads", type=int, default=1, help="Total concurrent episode workers")
+    parser.add_argument("--add", type=int, metavar="N", help="Append N new seeds to every task")
+    parser.add_argument("--fix", action="store_true", help="Recover interrupted recordings and missing exports")
+    parser.add_argument("--gui", action="store_true", help="Show task cameras with a single worker")
+    args = parser.parse_args(argv)
+    if args.out and (not args.task or args.add is not None or args.fix):
+        parser.error("--out requires --task; --add and --fix apply to --resume")
+    if args.resume and any(v is not None for v in (args.task, args.seed, args.episodes, args.max_play_rounds)):
+        parser.error("--resume inherits tasks, seed plan and play limit from the batch")
+    if args.task and len(set(args.task)) != len(args.task):
+        parser.error("list each task once")
+    if args.seed is not None and args.seed < 0:
+        parser.error("seed must be nonnegative")
+    if any(v is not None and v < 1 for v in (args.episodes, args.threads, args.max_play_rounds, args.add)):
+        parser.error("counts must be positive")
+    if args.gui and args.threads != 1:
+        parser.error("--gui requires --threads 1")
+    return args
+
+
+if __name__ == "__main__":
+    try:
+        run_batch(parse_args())
+    except (OSError, ValueError, RuntimeError) as error:
+        sys.exit(str(error))

@@ -1,5 +1,7 @@
 """Raw control ticks are durable for every outcome; publish complete successes to HDF5."""
 import json
+import os
+from tempfile import NamedTemporaryFile
 import time
 from pathlib import Path
 
@@ -46,25 +48,56 @@ class EpisodeRecorder:
     def close(self):
         self.tick_file.close()
 
-    def export(self, path, task, prompt, seed, source):
-        rows = [json.loads(line) for line in (self.raw / "ticks.jsonl").read_text("utf8").splitlines()]
-        if not rows or len(rows) != self.count or not rows[-1]["judge_after"]["success"]:
-            raise ValueError("Incomplete successful trajectory")
-        frame_dir = self.raw / "frames"
-        temp = path.with_suffix(".partial")
-        with h5py.File(temp, "x") as h:
-            h.attrs.update(task=task, prompt=prompt, seed=seed, fps=CONTROL_HZ, joint_names=json.dumps(self.joint_names),
-                           units=json.dumps((["rad"] * 5 + ["opening_0_1"]) * (len(self.joint_names) // 6)), source=source,
-                           scene_version=SCENE_VERSION, home_end_frame=self.home_end_frame)
-            h.create_dataset("action", data=np.asarray([r["action"] for r in rows], np.float32))
-            h.create_dataset("observations/state", data=np.asarray([r["state"] for r in rows], np.float32))
-            h.attrs["camera_names"] = json.dumps(self.cameras)
-            images = {name: h.create_dataset(f"observations/images/{name}", (len(rows), 480, 640, 3),
-                      dtype="u1", chunks=(1, 480, 640, 3), compression="lzf") for name in self.cameras}
-            for i, row in enumerate(rows):
-                if row["frame"] != f"f{i:06d}" or row["next_frame"] != f"f{i+1:06d}":
-                    raise ValueError("Misaligned control tick")
-                for camera, dataset in images.items():
-                    with Image.open(frame_dir / camera / (row["frame"] + ".png")) as img:
-                        dataset[i] = np.asarray(img)
-        temp.replace(path)
+
+def export_demo(raw, path, task, prompt, entry, joint_names, cameras):
+    """Publish once. A crash after publication can be reconciled against raw."""
+    rows = [json.loads(line) for line in (raw / "ticks.jsonl").read_text("utf8").splitlines()]
+    if not rows or len(rows) != entry["ticks"] or not rows[-1]["judge_after"]["success"]:
+        raise ValueError("Incomplete successful trajectory")
+    for i, row in enumerate(rows):
+        if (row["frame"], row["next_frame"]) != (f"f{i:06d}", f"f{i+1:06d}"):
+            raise ValueError("Misaligned control tick")
+    attrs = dict(task=task, prompt=prompt, seed=entry["seed"], fps=CONTROL_HZ,
+                 joint_names=json.dumps(joint_names), camera_names=json.dumps(cameras),
+                 units=json.dumps((["rad"] * 5 + ["opening_0_1"]) * (len(joint_names) // 6)),
+                 source="vista", scene_version=SCENE_VERSION, home_end_frame=entry["home_end_frame"])
+    arrays = {field: np.asarray([r[col] for r in rows], np.float32)
+              for field, col in (("action","action"), ("observations/state","state"))}
+    existing = path.exists()
+    if existing:
+        target = path
+    else:
+        with NamedTemporaryFile(dir=path.parent, prefix=path.stem+"-", suffix=".partial", delete=False) as temp:
+            target = Path(temp.name)
+    try:
+        with h5py.File(target, "r" if existing else "w") as h:
+            if existing:
+                if any(h.attrs.get(k) != v for k, v in attrs.items()):
+                    raise ValueError(f"Existing HDF5 metadata differs: {path}")
+            else:
+                h.attrs.update(attrs)
+            for field, values in arrays.items():
+                if existing:
+                    if not np.array_equal(h[field][:], values):
+                        raise ValueError(f"Existing HDF5 {field} differs: {path}")
+                else:
+                    h.create_dataset(field, data=values)
+            for camera in cameras:
+                name = f"observations/images/{camera}"
+                shape = (len(rows), 480, 640, 3)
+                images = h[name] if existing else h.create_dataset(name, shape, dtype="u1",
+                                  chunks=(1, 480, 640, 3), compression="lzf")
+                if images.shape != shape or images.dtype != np.uint8:
+                    raise ValueError(f"Invalid camera stream: {name}")
+                for i, row in enumerate(rows):
+                    with Image.open(raw / "frames" / camera / (row["frame"] + ".png")) as img:
+                        if existing:
+                            if not np.array_equal(images[i], np.asarray(img)):
+                                raise ValueError(f"Existing HDF5 image differs: {camera}/{i}")
+                        else:
+                            images[i] = np.asarray(img)
+        if not existing:
+            os.link(target, path)  # Atomic create-if-absent on a local filesystem.
+    finally:
+        if not existing:
+            target.unlink(missing_ok=True)

@@ -70,6 +70,47 @@ def _reject_constant(value):
     raise ValueError("non-finite JSON number")
 
 
+def responses_input(messages):
+    items = []
+    for message in messages:
+        if isinstance(message, AIMessage):
+            items.extend(message.additional_kwargs["response_items"])
+        elif isinstance(message, ToolMessage):
+            items.append({"type": "function_call_output", "call_id": message.tool_call_id,
+                          "output": message.content})
+        elif isinstance(message, (HumanMessage, SystemMessage)):
+            content = message.content
+            if isinstance(content, list):
+                blocks = []
+                for block in content:
+                    if block["type"] == "text":
+                        blocks.append({"type": "input_text", "text": block["text"]})
+                    elif block["type"] == "image_url":
+                        blocks.append({"type": "input_image", "image_url": block["image_url"]["url"]})
+                    else:
+                        raise ValueError("Unsupported Responses input block")
+                content = blocks
+            items.append({"role": "user" if isinstance(message, HumanMessage) else "system",
+                          "content": content})
+        else:
+            raise ValueError("Unsupported Responses message")
+    return items
+
+
+def parse_responses(data):
+    if data.get("status") != "completed":
+        raise RuntimeError(f"VISTA Responses status={data.get('status')}, details={data.get('incomplete_details')}")
+    items = data["output"]
+    calls = [{"type": "function", "id": item["call_id"], "function": {
+        "name": item["name"], "arguments": item["arguments"]}}
+        for item in items if item["type"] == "function_call"]
+    content = "".join(part["text"] for item in items if item["type"] == "message"
+                      for part in item["content"] if part["type"] == "output_text")
+    reply = parse_reply({"choices": [{"message": {"role": "assistant", "tool_calls": calls, "content": content}}]})
+    reply.additional_kwargs["response_items"] = items
+    return reply
+
+
 def parse_reply(data: dict) -> AIMessage:
     try:
         choices = data["choices"]
@@ -146,11 +187,16 @@ class ChatModel:
         if (parsed.scheme not in ("http", "https") or not parsed.hostname
                 or parsed.username or parsed.password or parsed.query or parsed.fragment):
             raise RuntimeError("VISTA 模型地址必须是 http(s) API 根地址或 chat/completions 地址")
-        self.endpoint = base if base.endswith("/chat/completions") else base + "/chat/completions"
+        self.responses = parsed.hostname == "api.openai.com" and (
+            parsed.path.endswith("/responses") or self.model == "gpt-6.2-sol")
+        if self.responses:
+            self.endpoint = base.removesuffix("/chat/completions").removesuffix("/responses") + "/responses"
+        else:
+            self.endpoint = base if base.endswith("/chat/completions") else base + "/chat/completions"
         self._headers = {"Authorization": f"Bearer {key}"} if key else {}
         if request_options is None:
             max_tokens = positive_integer(setting(("OPENAI_MAX_TOKENS", "max_tokens"), values, env,
-                                                   4096), "max_tokens")
+                                                   16384 if self.responses else 4096), "max_tokens")
             stream = setting(("OPENAI_STREAM", "stream"), values, env, "false")
             if str(stream).strip().lower() != "false":
                 raise RuntimeError("VISTA 第一版只接收完整 JSON 回复，请配置 stream=false")
@@ -167,15 +213,30 @@ class ChatModel:
         if set(request_options) - {"max_tokens", "max_completion_tokens", "thinking", "reasoning_effort"}:
             raise RuntimeError("VISTA request_options 含不支持的参数")
         self.options = deepcopy(request_options)
-        self._client = httpx.Client(timeout=120.0, transport=transport,
+        self._client = httpx.Client(timeout=600.0 if self.responses else 120.0, transport=transport,
                                     follow_redirects=False)
 
     def invoke(self, messages, *, tools: list[dict], system: str) -> AIMessage:
-        body = {"model": self.model, "messages": api_messages(messages, system),
-                "tools": tools, "tool_choice": "auto", "stream": False, **self.options}
+        if self.responses:
+            body = {"model": self.model, "instructions": system, "input": responses_input(messages),
+                    "tools": [{"type": "function", **tool["function"], "strict": False} for tool in tools],
+                    "store": False, "include": ["reasoning.encrypted_content"],
+                    "parallel_tool_calls": False,
+                    "max_output_tokens": self.options.get("max_completion_tokens", self.options.get("max_tokens"))}
+            if "reasoning_effort" in self.options:
+                body["reasoning"] = {"effort": self.options["reasoning_effort"]}
+        else:
+            body = {"model": self.model, "messages": api_messages(messages, system),
+                    "tools": tools, "tool_choice": "auto", "stream": False, **self.options}
         for attempt in range(3):
             try:
                 response = self._client.post(self.endpoint, headers=self._headers, json=body)
+                if response.status_code == 429 and attempt < 2:
+                    problem = response.json().get("error", {})
+                    if problem.get("code") == "rate_limit_exceeded":
+                        wait = response.headers.get("retry-after", "")
+                        time.sleep(float(wait) if wait.replace(".", "", 1).isdigit() else 10 * (attempt + 1))
+                        continue
                 break
             except (httpx.ConnectError, httpx.ConnectTimeout) as error:
                 if attempt == 2:
@@ -187,12 +248,17 @@ class ChatModel:
             advice = {401: "检查 API 凭据", 403: "检查访问权限", 404: "检查完整 API 地址（包括所需 /v1）",
                       413: "上下文或图片过大", 429: "请求限流或配额不足"}.get(
                           response.status_code, "检查端点的参数、图像/工具支持及上下文限制")
-            raise RuntimeError(f"VISTA 模型请求失败，HTTP {response.status_code}；{advice}。未自动重试。")
+            try:
+                problem = response.json()["error"]
+                detail = f"code={problem.get('code')}, param={problem.get('param')}"
+            except (ValueError, AttributeError, KeyError, TypeError):
+                detail = "无结构化错误"
+            raise RuntimeError(f"VISTA 模型请求失败，HTTP {response.status_code}，{detail}；{advice}。")
         try:
             data = response.json()
         except ValueError:
             raise RuntimeError("VISTA 模型端点未返回合法 JSON，未自动尝试其他地址。") from None
-        return parse_reply(data)
+        return parse_responses(data) if self.responses else parse_reply(data)
 
     def close(self):
         self._client.close()

@@ -76,7 +76,9 @@ class VistaStorage:
         self._last_owned_frame: int | None = None
         self._metadata: dict = {}
 
-    def begin_episode(self, collection_dir: Path, task_text: str, *, episode_name=None) -> None:
+    def begin_episode(self, collection_dir: Path, task_text: str, *, episode_name=None, attempt=None) -> None:
+        if attempt is not None:
+            self.root = self.run_dir
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             with self._guide_lock():
@@ -91,10 +93,13 @@ class VistaStorage:
                 if not re.fullmatch(r"ep_\d+", episode_name):
                     raise ValueError("无效的 episode 目录名")
                 episode = self.run_dir / episode_name
-                episode.mkdir(exist_ok=False)
+                if attempt is not None:
+                    episode = episode / f"attempt_{attempt:02d}"
+                episode.mkdir(parents=True, exist_ok=False)
             self.episode_dir = episode.resolve()
+            self.episode_name = episode_name
             self.frames_dir = collection_dir.resolve() / "frames"
-            self.frames_dir.mkdir()
+            self.frames_dir.mkdir(parents=True)
             (episode / "working.md").write_text(
                 "当前目标：根据腕部与旁观图像制定计划。\n当前假设：待观察。\n"
                 "下一步：检查初始图。\n预期：待提出动作。\n"
@@ -115,10 +120,10 @@ class VistaStorage:
         self._last_owned_frame = None
         self._metadata = {"format_version": 3, "fps": CONTROL_HZ,
                           "state_fields": list(self.joint_names),
-                          "collection_dir": str(Path(collection_dir).resolve()), "task": task_text}
+                          "collection_dir": "raw" if attempt is not None else str(Path(collection_dir).resolve()), "task": task_text}
         self.read_memory("guide")
         self.read_memory("working")
-        self.event("episode_start", collection_dir=str(Path(collection_dir).resolve()), task=task_text)
+        self.event("episode_start", collection_dir=self._metadata["collection_dir"], task=task_text)
 
     def _episode(self) -> Path:
         if self.episode_dir is None:
@@ -151,6 +156,7 @@ class VistaStorage:
 
     def log_message(self, message: BaseMessage) -> None:
         data = message_to_dict(message)
+        data["data"].get("additional_kwargs", {}).pop("response_items", None)
         provider = data["data"].get("additional_kwargs", {}).get("provider_message", {})
         for key in ("reasoning", "reasoning_content", "reasoning_details"):
             provider.pop(key, None)
@@ -201,7 +207,7 @@ class VistaStorage:
             for path in created:
                 path.unlink(missing_ok=True)
             raise RuntimeError(f"FRAME_UNAVAILABLE: unable to publish both cameras for {frame_id}") from None
-        info = {"episode_id": self._episode().name, "frame_id": frame_id, "frame_no": obs.frame_no,
+        info = {"episode_id": self.episode_name, "frame_id": frame_id, "frame_no": obs.frame_no,
                 "views": views, "source_batch_id": self.active_batch_id,
                 "state": list(obs.state.values), "observation": dict(zip(self.joint_names, obs.state.values)),
                 "tcp_mm": obs.tcp_mm}
@@ -258,7 +264,7 @@ class VistaStorage:
     def _guide_audit(self, operation, **fields):
         """Called with the guide lock held; one complete JSON line per operation."""
         event = {"time_ns": time.time_ns(), "pid": os.getpid(),
-                 "episode": self.episode_dir.name if self.episode_dir else None,
+                 "episode": self.episode_dir.relative_to(self.run_dir).as_posix() if self.episode_dir else None,
                  "operation": operation, **fields}
         with (self.root / "guide_access.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")

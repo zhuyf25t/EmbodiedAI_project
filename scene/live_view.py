@@ -7,6 +7,7 @@ import sys
 
 from PIL import Image
 
+from collection.batch import attempt_path, logs_for, read_manifest
 from contracts import CONTROL_HZ
 
 
@@ -14,7 +15,7 @@ def launch_viewer(run_dir):
     python = Path(sys.executable)
     if os.name == "nt" and python.with_name("pythonw.exe").exists():
         python = python.with_name("pythonw.exe")
-    with (run_dir / "viewer.log").open("a", encoding="utf8") as log:
+    with (logs_for(run_dir.parent) / run_dir.name / "viewer.log").open("a", encoding="utf8") as log:
         return subprocess.Popen([str(python), "-m", "scene.live_view", str(run_dir.resolve())],
                                 cwd=Path(__file__).resolve().parents[1], stdin=subprocess.DEVNULL,
                                 stdout=log, stderr=log)
@@ -48,9 +49,9 @@ class RunWindow:
         from tkinter import ttk
 
         self.root, self.directory = root, directory.resolve()
-        manifest = json.loads((self.directory / "manifest.json").read_text("utf8"))
-        self.cameras = manifest["cameras"]
-        root.title(f"VISTA · {manifest['task'].title()} · {directory.name}")
+        self.data, self.task = self.directory.parent, self.directory.name
+        self.cameras = read_manifest(self.data)["tasks"][self.task]["cameras"]
+        root.title(f"VISTA · {self.task.title()} · {self.data.name}")
         self.width = min(640, max(240, (root.winfo_screenwidth() - 80) // len(self.cameras)),
                          max(240, (root.winfo_screenheight() - 240) * 4 // 3))
         box = ttk.Frame(root, padding=8)
@@ -76,11 +77,10 @@ class RunWindow:
     def restart(self):
         self.current = -1
 
-    def select_episode(self, seed):
-        self.episode = f"ep_{seed:04d}"
-        self.raw = self.directory / "raw" / self.episode
-        self.log = (self.directory.parents[2] / "output" / "vista" / self.directory.parent.name
-                    / self.directory.name / self.episode / "calls.jsonl")
+    def select_episode(self, seed, attempt):
+        self.episode = seed, attempt
+        folder = attempt_path(self.data, self.task, seed, attempt)
+        self.raw, self.log = folder / "raw", folder / "calls.jsonl"
         self.tick_offset = self.call_offset = self.latest = 0
         self.current = -1
         self.batch = 0
@@ -134,16 +134,14 @@ class RunWindow:
         self.root.after(round(1000 / CONTROL_HZ), self.refresh)
 
     def update(self):
-        manifest = json.loads((self.directory / "manifest.json").read_text("utf8"))
-        if manifest.get("cameras") != self.cameras:
-            self.caption.set("采集清单中的相机与打开窗口时不一致。")
+        task = read_manifest(self.data)["tasks"][self.task]
+        latest = [row[-1] for row in task["episodes"].values() if row]
+        if not latest:
             return
-        started = [e for e in manifest["episodes"] if e["started"]]
-        if not started:
-            return
-        entry = started[-1]
-        if self.episode != f"ep_{entry['seed']:04d}":
-            self.select_episode(entry["seed"])
+        entry = max(latest, key=lambda e: e["started_ns"])
+        key = entry["seed"], entry["attempt"]
+        if self.episode != key:
+            self.select_episode(*key)
         if not (self.raw / "reset.json").is_file():
             return
         ticks, self.tick_offset = new_lines(self.raw / "ticks.jsonl", self.tick_offset)

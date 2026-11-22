@@ -9,6 +9,7 @@ import imageio_ffmpeg
 import numpy as np
 from PIL import Image, ImageDraw
 
+from collection.batch import attempt_path, read_manifest
 from collection.recorder import save_json
 from contracts import CONTROL_HZ, DUAL_JOINT_NAMES, JOINT_NAMES, JointPositions, SCENE_VERSION
 from scene.task_video import TaskVideo
@@ -25,7 +26,7 @@ def replay_actions(task, entry, raw, ticks):
     from scene.stack import Stack
     from scene.sort import Sort
 
-    edges = sorted({0, entry["home_end_frame"]-1, entry["home_end_frame"], len(ticks)})
+    edges = sorted({0, max(0, entry.get("home_end_frame",0)-1), entry.get("home_end_frame",0), len(ticks)})
     image_errors = []
     with TabletopEnv({"lift":Lift,"stack":Stack,"sort":Sort}[task]) as env:
         obs, _ = env.reset(seed=entry["seed"],finish_on_success=False,limit_ticks=False)
@@ -51,11 +52,14 @@ def replay_actions(task, entry, raw, ticks):
     return dict(ticks=len(ticks), frames_compared=edges, max_camera_mean_abs_error=max(image_errors))
 
 
-def review(run, entry, manifest, replay=False):
+def review(run, entry, manifest, replay=False, *, evidence=None):
     ep = f"ep_{entry['seed']:04d}"
     task = manifest["task"]
-    raw = run / "raw" / ep
-    out = run.parents[2] / "output/vista" / task / run.name / ep
+    if evidence is None:  # Historical, per-task run directory.
+        raw = run / "raw" / ep
+        out = run.parents[2] / "output/vista" / task / run.name / ep
+    else:
+        out, raw = evidence, evidence / "raw"
     events = records(out / "calls.jsonl")
     ticks = records(raw / "ticks.jsonl")
     cameras = manifest["cameras"]
@@ -157,9 +161,36 @@ def review(run, entry, manifest, replay=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
+    parser.add_argument("--seed", type=int, help="Review one seed")
+    parser.add_argument("--attempt", type=int, help="Review one attempt number for that seed")
     parser.add_argument("--replay", action="store_true", help="Replay recorded targets in the matching physics scene")
     args = parser.parse_args()
-    manifest = json.loads((args.run / "manifest.json").read_text("utf8"))
-    for entry in manifest["episodes"]:
-        if entry["status"] in ("finished", "interrupted"):
-            review(args.run, entry, manifest, replay=args.replay)
+    if args.attempt is not None and (args.seed is None or args.attempt < 1):
+        parser.error("--attempt requires --seed and a positive attempt number")
+    run = args.run.resolve()
+    if (run / "manifest.json").is_file():
+        manifest = json.loads((run / "manifest.json").read_text("utf8"))
+        if "episodes" not in manifest:
+            parser.error("specify a task directory, e.g. data/run01/sort")
+        for entry in manifest["episodes"]:
+            if entry["status"] in ("finished", "interrupted") and (args.seed is None or args.seed == entry["seed"]):
+                review(run, entry, manifest, replay=args.replay)
+    else:
+        batch = read_manifest(run.parent)
+        task = batch["tasks"][run.name]
+        metadata = dict(task=run.name, cameras=task["cameras"], scene_version=batch["scene_version"])
+        reviewed = 0
+        for row in task["episodes"].values():
+            for entry in row:
+                if ((args.seed is not None and args.seed != entry["seed"])
+                        or (args.attempt is not None and args.attempt != entry["attempt"])
+                        or entry["status"] not in ("finished", "interrupted")):
+                    continue
+                evidence = attempt_path(run.parent, run.name, entry["seed"], entry["attempt"])
+                if not (evidence / "raw/reset.json").is_file() or not (evidence / "raw/ticks.jsonl").is_file():
+                    print(f"No recording available: {evidence}")
+                    continue
+                review(run.parent, entry, metadata, args.replay, evidence=evidence)
+                reviewed += 1
+        if (args.seed is not None or args.attempt is not None) and not reviewed:
+            parser.error("no recorded attempt matched the selection")
