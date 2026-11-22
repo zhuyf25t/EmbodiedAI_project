@@ -1,0 +1,10 @@
+mujoco==3.3.7
+numpy==2.2.6
+scipy==1.15.3
+imageio-ffmpeg==0.6.0
+pillow==11.3.0
+httpx==0.28.1
+python-dotenv==1.2.3
+langgraph==1.2.12
+langchain-core==1.6.5
+h5py==3.16.0

@@ -1,0 +1,334 @@
+"""Nine model-facing tools. Only play/finish hand control back to the collector."""
+
+from __future__ import annotations
+
+import json
+import math
+from copy import deepcopy
+
+from langchain_core.messages import ToolMessage
+from PIL import Image
+from contracts import CAMERAS
+
+from .model import image_message
+from .settings import VistaSettings
+from .state import validate_reply
+from .storage import GuideConflict, HistoryQueryError, VistaStorage
+
+
+class _Arguments(ValueError):
+    def __init__(self, code, message, hint="请根据工具说明修改参数"):
+        super().__init__(message)
+        self.code, self.hint = code, hint
+
+
+def success(data):
+    return {"ok": True, "data": data, "error": None}
+
+
+def failure(code, message, hint="请根据工具说明修改参数"):
+    return {"ok": False, "data": None, "error": {
+        "code": code, "message": message, "can_retry": True, "hint": hint}}
+
+
+def _object(properties, required=()):
+    return {"type": "object", "properties": properties, "required": list(required),
+            "additionalProperties": False}
+
+
+def _text(description, maximum=1024):
+    return {"type": "string", "description": description, "minLength": 1, "maxLength": maximum}
+
+
+def _integer(description, minimum=None, maximum=None):
+    schema = {"type": "integer", "description": description}
+    if minimum is not None:
+        schema["minimum"] = minimum
+    if maximum is not None:
+        schema["maximum"] = maximum
+    return schema
+
+
+def _check(schema, value, path="参数"):
+    """Validate the small JSON Schema vocabulary used below, without coercion."""
+    if "oneOf" in schema:
+        name = value.get("action") if isinstance(value, dict) else None
+        branch = next((item for item in schema["oneOf"]
+                       if name in item["properties"]["action"]["enum"]), None)
+        if branch is None:
+            raise _Arguments("INVALID_ACTION", f"{path} 中的动作不受支持，done 只能通过 finish 调用")
+        return _check(branch, value, path)
+    kind = schema.get("type")
+    valid = {"object": isinstance(value, dict), "array": isinstance(value, list),
+             "string": isinstance(value, str), "boolean": type(value) is bool,
+             "integer": type(value) is int,
+             "number": type(value) is int or type(value) is float and math.isfinite(value)}.get(kind, False)
+    if not valid:
+        raise _Arguments("INVALID_ARGUMENT", f"{path} 必须是 {kind} 类型；不接受 null 或隐式类型转换")
+    if "enum" in schema and value not in schema["enum"]:
+        raise _Arguments("INVALID_ARGUMENT", f"{path} 必须取工具说明中的枚举值")
+    if kind == "object":
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties") is False and set(value) - props.keys():
+            raise _Arguments("INVALID_ARGUMENT", f"{path} 含未知参数：{', '.join(map(str, set(value) - props.keys()))}")
+        missing = set(schema.get("required", [])) - value.keys()
+        if missing:
+            raise _Arguments("INVALID_ARGUMENT", f"{path} 缺少参数：{', '.join(sorted(missing))}")
+        for key, item in value.items():
+            if key in props:
+                _check(props[key], item, f"{path}.{key}")
+    elif kind == "array":
+        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", math.inf):
+            raise _Arguments("INVALID_ARGUMENT", f"{path} 的条目数量不符合限制")
+        for index, item in enumerate(value):
+            _check(schema["items"], item, f"{path}[{index}]")
+    elif kind == "string":
+        if (not value.strip() or not schema.get("minLength", 0) <= len(value)
+                <= schema.get("maxLength", math.inf)):
+            raise _Arguments("INVALID_ARGUMENT", f"{path} 不能为空白，且必须符合字符数限制")
+    elif kind in ("number", "integer"):
+        if not schema.get("minimum", -math.inf) <= value <= schema.get("maximum", math.inf):
+            raise _Arguments("INVALID_ARGUMENT", f"{path} 超出允许范围")
+
+
+def tool_schemas(settings: VistaSettings, actions: dict, cameras=CAMERAS) -> list[dict]:
+    coordinates = ("原图像素坐标：左上角 (0,0)，x 向右，y 向下；"
+                   "区域为 [x,x+width) × [y,y+height)，必须在原图宽高内；不是展示裁图坐标。")
+    region = _object({name: _integer(coordinates if name in ("x", "y") else "原图区域的正整数宽/高")
+                      for name in ("x", "y", "width", "height")}, ("x", "y", "width", "height"))
+    region["description"] = coordinates
+    view = {"label": _text("这张图在比较中的角色，例如批次前", settings.max_label_chars),
+            "camera": {"type": "string", "enum": list(cameras), "description": "选择当前观测中的相机"},
+            "frame_id": _text("当前 episode 内已归档的原图编号，例如 f000000；不是文件名或路径。当前图也可查询，无需先存在 history 批次记录", 64), "region": region}
+    inspect_schema = _object({"question": _text("此次查图要直接看清的状态、关系或待解决疑点；原文保留在上下文中", settings.max_question_chars),
+                              "views": {"type": "array", "minItems": 1, "maxItems": settings.max_views,
+                                        "items": _object(view, ("label", "frame_id", "camera"))}}, ("question", "views"))
+    pixel_view = {**deepcopy(view),
+                  "rows": _integer("均匀采样行数，不是像素高度；不能超过 region.height；本区域点数为 rows×columns",
+                                   1, settings.max_samples),
+                  "columns": _integer("均匀采样列数，不是像素宽度；不能超过 region.width；本区域点数为 rows×columns",
+                                      1, settings.max_samples)}
+    pixels_schema = _object({"question": _text("此次取像素的检查目的", settings.max_question_chars),
+                             "views": {"type": "array", "minItems": 1, "maxItems": settings.max_views,
+                                       "description": "每个区域的 label、frame_id、region、rows、columns 都放在该 views 元素内，不放在顶层。",
+                                       "items": _object(pixel_view, pixel_view.keys())}}, ("question", "views"))
+    action_variants = []
+    for name, definition in actions.items():
+        action_variants.append(_object({"action": {"type": "string", "enum": [name],
+                                                   "description": definition["description"]},
+                                         "args": definition["parameters"]}, ("action", "args")))
+    guide_scope = "scope=environment：同一套场景、相机和控制设定的经验，跨多个 episode 保留。"
+    working_scope = "scope=episode：从环境初始化到任务结束的一次完整实验，跨工具调用和动作批次保留，新实验另建文件。"
+    definitions = [
+        ("inspect", "按 frame_id 读取当前或历史归档原图/裁剪图；图旁 observation 属于该原图采样时刻，帧号间隔为0.1秒。"
+         "通过图片索引查找，不依赖 history 中已有动作记录；不推进环境、不回答 question、不改变当前观测。" + coordinates,
+         inspect_schema),
+        ("read_pixels", "从原图区域的均匀网格中心读取 RGB 和坐标，不识别物体；"
+         f"总点数为所有 views 的 rows×columns 之和，最多 {settings.max_samples} 点，这是上限而非建议用量。"
+         "先用 inspect 定位，只对待核实的小区域稀疏取色，不用密集取色代替看图；小块参考色通常用3×3点即可。" + coordinates,
+         pixels_schema),
+        ("history", "查询本 episode 历史，不推进环境、不改变当前帧、不自动返回图片；用inspect查看返回的frame_id。"
+         "mode=batch返回完整决策记录（含pending/结束行）、动作、实际执行区间及observations；"
+         "记录的frame_range=[k,m]表示执行区间[k,m)，完成批次存o_k至o_(m-1)，o_m归下一条；pending行已有当前观测。"
+         "mode=frame按start,start+step,...<=end返回frame_no/frame_id/state/batch_id；"
+         "batch_id表示观测归属记录，尚未归属时为null。state顺序由state_fields说明。"
+         "查询start/end均包含两端；有start从前向后分页，没有start取截至end的最近一页；"
+         "frame省略start时抽样从0对齐。返回当前帧、可查范围、truncated和可直接重调的next_query。"
+         f"batch单页最多{settings.history_max_observations}个观测，超过须缩小范围或改用frame；不会拆开批次。",
+         _object({"mode": {"type": "string", "enum": ["batch", "frame"], "default": "batch",
+                           "description": "batch按决策记录查询；frame按控制帧查询"},
+                  "start": _integer("包含的起点：batch从1编号，frame从0编号；省略则取最近一页", 0),
+                  "end": _integer("包含的终点；省略或超过已存范围时截至当前可查询末尾", 0),
+                  "step": {**_integer("仅frame可设大于1的步长；从start开始等差抽样", 1), "default": 1},
+                  "limit": {**_integer("最多返回的批次或抽样帧条数，不是动作数", 1, settings.history_max_limit),
+                            "default": settings.history_default_limit}})),
+        ("read_guide", "读取共享指南及其revision版本；其他进程也会更新。" + guide_scope, _object({})),
+        ("write_guide", "终帧复核时，记录按 system prompt 操作且经前后帧验证的跨局技巧。写明适用条件和证据帧号。没有新技巧可以直接 finish。完整替换指南，base_revision 须为你已读版本。"
+         "发生GUIDE_CONFLICT时本次没有写入；先read_guide重读，由你合并新旧经验后再提交，不能原样覆盖他人更新。" + guide_scope,
+         _object({"content": _text("合并后完整新版指南", settings.max_guide_chars),
+                  "base_revision": _text("从初始指南或read_guide返回值复制的revision", 64)},
+                 ("content", "base_revision"))),
+        ("read_working", "读取当前计划、假设、预期和未决问题。" + working_scope, _object({})),
+        ("write_working", "完整替换本次实验草稿，不会修改历史事实。" + working_scope,
+         _object({"content": _text("完整新版草稿", settings.max_working_chars)}, ("content",))),
+        ("play", "提交一批按数组顺序连续执行的动作，使用 move_by 毫米增量、开闭爪与 observe。"
+         "批内不再调用模型，结束后反馈最终图及同一时刻的 observation 实测状态。"
+         "全过程按10Hz归档，可通过帧号回看；history 的 observations 记录本批执行区间内各帧。必须独占本条模型回复；expectation 是整批预期，不是成功证明。",
+         _object({"actions": {"type": "array", "minItems": 1, "maxItems": settings.max_actions,
+                               "items": {"oneOf": action_variants}},
+                  "expectation": _text("整批结束后预期看见的变化；若用于验证，说明要直接看清什么、支持或否定假设的结果，以及何时仍无法判断", settings.max_question_chars),
+                  "basis_frame_id": _text("必须等于当前观察的 frame_id，不能使用回看的旧图", 64)},
+                 ("actions", "expectation", "basis_frame_id"))),
+        ("finish", "提出结束当前 episode，success 仅为模型自评。独占一条回复，不执行动作、不新增图片；保留当前观测的空动作结束记录。",
+         _object({"success": {"type": "boolean", "description": "模型根据视觉自评任务是否完成"},
+                  "reason": _text("结束原因及不确定性", settings.max_question_chars),
+                  "evidence_frame_ids": {"type": "array", "maxItems": settings.max_views,
+                                         "items": _text("本 episode 已归档的证据帧编号", 64)}}, ("success", "reason"))),
+    ]
+    return [{"type": "function", "function": {"name": name, "description": description,
+                                               "parameters": schema}}
+            for name, description, schema in definitions]
+
+
+class VistaTools:
+    def __init__(self, storage: VistaStorage, settings: VistaSettings, control_schemas: dict):
+        self.storage, self.settings = storage, settings
+        self.actions = control_schemas
+        self.schemas = tool_schemas(settings, self.actions, storage.cameras)
+        self.parameters = {item["function"]["name"]: item["function"]["parameters"] for item in self.schemas}
+
+    def _frame(self, frame_id):
+        try:
+            return self.storage.frame_info(frame_id)
+        except KeyError:
+            raise _Arguments("FRAME_NOT_FOUND", f"当前 episode 不存在图片 {frame_id}",
+                             "使用已公布的 frame_id，或通过 history 查询") from None
+
+    def _views(self, args, pixels=False):
+        prepared, total = [], 0
+        for view in args["views"]:
+            info = self._frame(view["frame_id"])
+            info = {**info, **info["views"][view["camera"]]}
+            region = view.get("region", {"x": 0, "y": 0, "width": info["width"], "height": info["height"]})
+            x, y, width, height = (region[key] for key in ("x", "y", "width", "height"))
+            if x < 0 or y < 0 or width < 1 or height < 1 or x + width > info["width"] or y + height > info["height"]:
+                raise _Arguments("REGION_OUT_OF_BOUNDS", f"区域超出原图 {info['width']}×{info['height']}",
+                                 f"原图左上角 (0,0)；x+width<={info['width']}，y+height<={info['height']}")
+            if pixels:
+                if not (1 <= view["rows"] <= height and 1 <= view["columns"] <= width):
+                    raise _Arguments("INVALID_GRID", "rows/columns 必须是正整数，且不能超过区域高/宽")
+                total += view["rows"] * view["columns"]
+            prepared.append((view, info, region))
+        if total > self.settings.max_samples:
+            raise _Arguments("SAMPLE_LIMIT", f"请求了 {total} 点，总采样点数不能超过 {self.settings.max_samples}",
+                             "总点数为所有 views 的 rows×columns 之和；减少采样行列数，先用 inspect 定位再稀疏取色")
+        return prepared
+
+    def invoke(self, name: str, args) -> tuple[dict | None, list]:
+        """None means a validated handoff; it does NOT mean physical success."""
+        try:
+            if name not in self.parameters:
+                raise _Arguments("UNKNOWN_TOOL", "未知工具，请使用提供的九个工具名")
+            if isinstance(args, dict):
+                views = args.get("views")
+                if name in ("inspect", "read_pixels") and isinstance(views, list) and len(views) > self.settings.max_views:
+                    raise _Arguments("TOO_MANY_VIEWS", f"一次最多 {self.settings.max_views} 幅图")
+                actions = args.get("actions")
+                if name == "play" and isinstance(actions, list):
+                    if not actions:
+                        raise _Arguments("INVALID_ACTION", "play.actions 不能为空")
+                    if len(actions) > self.settings.max_actions:
+                        raise _Arguments("ACTION_LIMIT", f"每批最多 {self.settings.max_actions} 个动作")
+            try:
+                _check(self.parameters[name], args)
+            except _Arguments as error:
+                if name in ("write_guide", "write_working") and isinstance(args, dict) and set(args) == {"content"}:
+                    error.code = "INVALID_CONTENT"
+                if name == "read_pixels" and (".rows" in str(error) or ".columns" in str(error)):
+                    error.code = "INVALID_GRID"
+                raise
+            if name == "play":
+                if getattr(self, "review_only", False):
+                    raise _Arguments("EPISODE_CLOSED", "仿真已结束，检查终帧并调用 finish。")
+                if args["basis_frame_id"] != self.storage.current_frame_id:
+                    raise _Arguments("STALE_OBSERVATION", "动作依据不是当前观察",
+                                     f"当前 frame_id={self.storage.current_frame_id}")
+                return None, []
+            if name == "finish":
+                if not getattr(self, "review_only", False):
+                    raise _Arguments("EPISODE_ACTIVE", "动作阶段请提交 play；收到终帧复核通知后再提交 finish。")
+                for frame_id in args.get("evidence_frame_ids", []):
+                    self._frame(frame_id)
+                return None, []
+            if name in ("read_guide", "read_working"):
+                return success(self.storage.read_memory(name.removeprefix("read_"))), []
+            if name in ("write_guide", "write_working"):
+                if name == "write_guide" and not getattr(self, "review_only", False):
+                    raise _Arguments("EPISODE_ACTIVE", "当前观察先记 working。终帧复核时再将有证据的技巧写入 guide。")
+                try:
+                    return success(self.storage.write_memory(name.removeprefix("write_"), args["content"],
+                                   base_revision=args.get("base_revision"))), []
+                except GuideConflict as error:
+                    result = failure("GUIDE_CONFLICT", str(error),
+                                     "先read_guide获取完整最新版，合并保留他人经验，再用新base_revision提交")
+                    result["data"] = {"current_revision": error.latest["revision"], "written": False}
+                    return result, []
+            if name == "history":
+                mode = args.get("mode", "batch")
+                if args.get("start", 0) > args.get("end", math.inf):
+                    raise _Arguments("INVALID_ARGUMENT", "start 不能大于 end")
+                if mode == "batch" and (args.get("step", 1) != 1
+                                        or any(args.get(key) == 0 for key in ("start", "end"))):
+                    raise _Arguments("INVALID_ARGUMENT", "batch 编号从1开始且不能跳步；按帧抽样请用 mode=frame")
+                try:
+                    return success(self.storage.history(**args)), []
+                except HistoryQueryError as error:
+                    raise _Arguments("HISTORY_LIMIT", str(error), "缩小批次范围，或用 mode=frame 查询所需帧") from None
+            prepared = self._views(args, pixels=name == "read_pixels")
+            images, output, total = [], [], 0
+            for view, info, region in prepared:
+                original = self.storage.load_image(view["frame_id"], view["camera"])
+                x, y, width, height = (region[key] for key in ("x", "y", "width", "height"))
+                meta = {"label": view["label"], "source_frame_id": info["frame_id"], "camera": view["camera"],
+                        "episode_id": info["episode_id"], "original_size": [info["width"], info["height"]],
+                        "region": dict(region)}
+                if name == "inspect":
+                    scale = self.settings.inspect_edge / max(width, height)
+                    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                    rendered = original.crop((x, y, x + width, y + height)).resize(size, Image.Resampling.NEAREST)
+                    meta["rendered_size"] = list(size)
+                    images.append(({**meta, "frame_no": info["frame_no"],
+                                    "observation": info["observation"]}, rendered))
+                else:
+                    rows, columns = view["rows"], view["columns"]
+                    samples = []
+                    for row in range(rows):
+                        sample_y = y + (2 * row + 1) * height // (2 * rows)
+                        line = []
+                        for column in range(columns):
+                            sample_x = x + (2 * column + 1) * width // (2 * columns)
+                            line.append({"x": sample_x, "y": sample_y,
+                                         "rgb": list(original.getpixel((sample_x, sample_y)))})
+                        samples.append(line)
+                    meta["samples"] = samples
+                    total += rows * columns
+                output.append(meta)
+            data = {"current_state_unchanged": True, "views": output}
+            if name == "read_pixels":
+                data["sample_count"] = total
+            return success(data), images
+        except _Arguments as error:
+            return failure(error.code, str(error), error.hint), []
+
+    def node(self, state):
+        calls = validate_reply(state["messages"][-1])
+        messages, images = [], []
+        for call in calls:
+            self.storage.event("tool_request", tool_call_id=call["id"], name=call["name"], args=call["args"])
+        group_error = None
+        if len(calls) > self.settings.max_tool_calls:
+            group_error = failure("TOOL_CALL_LIMIT", f"每条回复最多 {self.settings.max_tool_calls} 个本地工具调用")
+        elif len(calls) > 1 and any(call["name"] in ("play", "finish") for call in calls):
+            group_error = failure("HANDOFF_MUST_BE_ALONE", "play/finish 必须独占一条回复；多个动作请放在 play.actions 内")
+        for index, call in enumerate(calls):
+            try:
+                result, views = (deepcopy(group_error), []) if group_error else self.invoke(call["name"], call["args"])
+                if result is None:
+                    self.storage.event("handoff_validated", tool_call_id=call["id"], name=call["name"])
+                    return {}
+                self.storage.event("tool_result", tool_call_id=call["id"], result=result)
+                message = ToolMessage(tool_call_id=call["id"], content=json.dumps(result, ensure_ascii=False))
+                self.storage.log_message(message)
+                messages.append(message)
+                images.extend(({**meta, "tool_call_id": call["id"], "current_state_unchanged": True}, image)
+                              for meta, image in views)
+            except Exception as error:
+                self.storage.diagnostic("tool_fatal", error, tool_call_id=call["id"],
+                                        not_executed_ids=[item["id"] for item in calls[index + 1:]])
+                raise
+        # All text tool results precede any user image block, including multi-tool replies.
+        if images:
+            message = image_message(images, "以下是本轮 inspect 请求的归档图片；环境未变化，当前帧编号保持不变。")
+            self.storage.log_message(message)
+            messages.append(message)
+        return {"messages": messages}
