@@ -16,7 +16,7 @@ from brains.vista.model import ChatModel
 from brains.vista.settings import VistaSettings
 from brains.vista.state import action_result, batch_status
 from collection.batch import (attempt_path, batch_name, extend, file_hash, jobs, logs_for,
-                              new_manifest, read_manifest, save_attempt, write_manifest)
+                              new_manifest, provider_for_seed, read_manifest, save_attempt, write_manifest)
 from collection.recorder import EpisodeRecorder, export_demo, save_json
 from contracts import DUAL_JOINT_NAMES, JOINT_NAMES, ObservationWindow, SCENE_VERSION
 from control.vista import action_schemas, ArmExecutor
@@ -171,10 +171,11 @@ def provider_config(model):
 
 
 def same_provider(a, b):
-    # A run can compare reasoning efforts; each new attempt records its own setting.
+    # The actual effort and reply budget belong to the individual attempt.
     def fixed(config):
         options = dict(config["request_options"])
         options.pop("reasoning_effort", None)
+        options.pop("max_tokens", None)
         return {**config, "request_options": options}
     return fixed(a) == fixed(b)
 
@@ -259,8 +260,8 @@ def record_job(data, task, seed, operation, expected, model_factory=ChatModel, d
         try:
             model = model_factory()
             entry["provider"] = provider_config(model)
-            if not same_provider(entry["provider"], manifest["provider"]):
-                raise ValueError("Model configuration differs from the batch")
+            if not same_provider(entry["provider"], provider_for_seed(manifest, seed)):
+                raise ValueError(f"Model configuration differs from the recording plan for seed {seed}")
             persist()
             with TabletopEnv(TASKS[task]) as env:
                 brain = VistaBrain(run_dir=folder, system_prompt=(folder / "system_prompt.txt").read_text("utf8"),
@@ -315,12 +316,18 @@ def run_batch(args, *, root=Path("."), model_factory=ChatModel):
             if manifest["scene_version"] != SCENE_VERSION:
                 raise ValueError("Scene version differs from the batch")
             if args.add:
-                extend(manifest, args.add)
+                extend(manifest, args.add, current_provider())
             queue = [(task, seed, op, len(manifest["tasks"][task]["episodes"][str(seed)]))
                      for task, seed, op in jobs(data, manifest, args.fix)]
             if any(op == "record" for _, _, op, _ in queue):
-                if not same_provider(current_provider(), manifest["provider"]):
-                    raise ValueError("Use the model and request options recorded in manifest.json")
+                active = current_provider()
+                eligible = [job for job in queue if job[2] != "record"
+                            or same_provider(active, provider_for_seed(manifest, job[1]))]
+                if not eligible:
+                    raise ValueError("Pending seeds require a different model configuration in manifest.json")
+                if len(eligible) < len(queue):
+                    print(f"Deferred {len(queue) - len(eligible)} recordings assigned to another model", flush=True)
+                queue = eligible
                 for task, spec in manifest["tasks"].items():
                     if file_hash(logs / task / "system_prompt.txt") != spec["prompt_sha256"]:
                         raise ValueError(f"Saved {task} system prompt has changed")

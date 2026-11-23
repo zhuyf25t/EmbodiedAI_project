@@ -35,6 +35,10 @@ class OfflineInterruption(OfflineModel):
         raise RuntimeError("test rate limit")
 
 
+class OtherOfflineModel(OfflineModel):
+    model = "second-offline-model"
+
+
 class CollectionBatchTest(unittest.TestCase):
     def setUp(self):
         scratch = tempfile.TemporaryDirectory()
@@ -49,6 +53,7 @@ class CollectionBatchTest(unittest.TestCase):
         before = dict(model="m1", api="responses", request_options={"reasoning_effort": "xhigh", "temperature": 0.1})
         after = {**before, "request_options": {"reasoning_effort": "high", "temperature": 0.1}}
         self.assertTrue(same_provider(before, after))
+        self.assertTrue(same_provider(before, {**after, "request_options": {**after["request_options"], "max_tokens": 16384}}))
         self.assertFalse(same_provider(before, {**after, "model": "m2"}))
         self.assertFalse(same_provider(before, {**after, "api": "chat_completions"}))
         self.assertFalse(same_provider(before, {**after, "request_options": {"temperature": 0.2}}))
@@ -101,6 +106,26 @@ class CollectionBatchTest(unittest.TestCase):
         attempts = read_manifest(self.data)["tasks"]["lift"]["episodes"]["0"]
         self.assertEqual([a["status"] for a in attempts], ["interrupted", "finished"])
         self.assertEqual(attempts[0]["reason"], "worker stopped before finalization")
+
+    def test_add_with_new_model_and_repair_each_seed_with_its_assigned_model(self):
+        with self.assertRaises(RuntimeError):
+            self.collect("--out run01 --task lift --max-play-rounds 1", OfflineInterruption)
+        self.collect("--resume run01 --add 2 --fix --threads 2", OtherOfflineModel)
+        m = read_manifest(self.data)
+        self.assertEqual(m["provider"]["model"], OfflineModel.model)
+        self.assertEqual([(c["first_seed"], c["provider"]["model"]) for c in m["provider_changes"]],
+                         [(1, OtherOfflineModel.model)])
+        rows = m["tasks"]["lift"]["episodes"]
+        self.assertEqual(len(rows["0"]), 1)
+        self.assertEqual([rows[s][0]["provider"]["model"] for s in ("1", "2")],
+                         [OtherOfflineModel.model] * 2)
+        with self.assertRaises(ValueError):
+            self.collect("--resume run01 --fix", OtherOfflineModel)
+        self.collect("--resume run01 --fix")
+        final = read_manifest(self.data)["tasks"]["lift"]["episodes"]
+        self.assertEqual(final["0"][-1]["provider"]["model"], OfflineModel.model)
+        self.assertEqual(final["1"], rows["1"])
+        self.assertEqual(final["2"], rows["2"])
 
     def test_export_repair_and_existing_file_are_write_once(self):
         self.collect("--out run01 --task lift --max-play-rounds 1")

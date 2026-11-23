@@ -117,8 +117,11 @@ def parse_reply(data: dict) -> AIMessage:
         if not isinstance(choices, list) or len(choices) != 1:
             raise ValueError("expected one choice")
         choice = choices[0]
-        if choice.get("finish_reason") in ("length", "content_filter"):
-            raise RuntimeError("VISTA 模型回复被截断或拦截；未执行其中的工具调用。")
+        if choice.get("finish_reason") == "length":
+            used = (data.get("usage") or {}).get("completion_tokens")
+            raise RuntimeError(f"VISTA 模型回复被截断（finish_reason=length, completion_tokens={used}）。")
+        if choice.get("finish_reason") == "content_filter":
+            raise RuntimeError("VISTA 模型回复被拦截（finish_reason=content_filter）。")
         raw = choice["message"]
         if raw.get("role", "assistant") != "assistant":
             raise ValueError("invalid role")
@@ -195,14 +198,15 @@ class ChatModel:
             self.endpoint = base if base.endswith("/chat/completions") else base + "/chat/completions"
         self._headers = {"Authorization": f"Bearer {key}"} if key else {}
         if request_options is None:
+            thinking = setting(("OPENAI_THINKING", "thinking"), values, env,
+                               "enabled" if parsed.hostname == "api.deepseek.com" else None)
+            default_tokens = 16384 if self.responses or thinking == "enabled" else 4096
             max_tokens = positive_integer(setting(("OPENAI_MAX_TOKENS", "max_tokens"), values, env,
-                                                   16384 if self.responses else 4096), "max_tokens")
+                                                   default_tokens), "max_tokens")
             stream = setting(("OPENAI_STREAM", "stream"), values, env, "false")
             if str(stream).strip().lower() != "false":
                 raise RuntimeError("VISTA 第一版只接收完整 JSON 回复，请配置 stream=false")
             request_options = {"max_tokens": max_tokens}
-            thinking = setting(("OPENAI_THINKING", "thinking"), values, env,
-                               "disabled" if parsed.hostname == "api.deepseek.com" else None)
             if thinking:
                 if thinking not in ("enabled", "disabled"):
                     raise RuntimeError("thinking 必须是 enabled 或 disabled")

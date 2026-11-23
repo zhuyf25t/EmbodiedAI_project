@@ -54,8 +54,17 @@ def new_manifest(name, tasks, seeds, max_play, provider):
                                   episodes={str(n): [] for n in seeds}) for task in tasks})
 
 
-def extend(manifest, count):
+def provider_for_seed(manifest, seed):
+    for change in reversed(manifest.get("provider_changes", [])):
+        if seed >= change["first_seed"]:
+            return change["provider"]
+    return manifest["provider"]
+
+
+def extend(manifest, count, provider=None):
     first = manifest["seeds"][-1] + 1
+    if provider is not None and provider != provider_for_seed(manifest, first - 1):
+        manifest.setdefault("provider_changes", []).append(dict(first_seed=first, provider=provider))
     new = range(first, first + count)
     manifest["seeds"].extend(new)
     for task in manifest["tasks"].values():
